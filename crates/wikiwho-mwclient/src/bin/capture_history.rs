@@ -294,22 +294,51 @@ fn already_complete(path: &Path, target_rev_id: u64) -> Result<bool> {
     if size == 0 {
         return Ok(false);
     }
-    let take = size.min(4096);
-    f.seek(SeekFrom::End(-(take as i64)))?;
-    let mut tail = vec![0u8; take as usize];
-    f.read_exact(&mut tail)?;
-    let last_line_bytes = tail
-        .rsplit(|&b| b == b'\n')
-        .find(|s| !s.is_empty())
-        .unwrap_or(&tail);
-    let last_line = std::str::from_utf8(last_line_bytes)?;
-    let obj: serde_json::Value = match serde_json::from_str(last_line) {
-        Ok(v) => v,
-        Err(_) => return Ok(false),
+    // A single Wikipedia revision's JSON can be hundreds of KB (the
+    // article body lives inside it), so a fixed 4-KB tail read is
+    // unreliable on real fixtures — it returns a JSON fragment, fails
+    // to parse, and we trigger an unnecessary re-fetch. Read backwards
+    // in chunks until we have either (a) a full final line bracketed
+    // by a preceding newline, or (b) the whole file.
+    let mut chunk: u64 = 16 * 1024;
+    loop {
+        let take = chunk.min(size);
+        f.seek(SeekFrom::End(-(take as i64)))?;
+        let mut buf = vec![0u8; take as usize];
+        f.read_exact(&mut buf)?;
+        // The file ends with a newline; trim trailing newlines first
+        // so the rsplit logic finds the actual last record.
+        let trimmed = trim_trailing_newlines(&buf);
+        if let Some(newline_pos) = trimmed.iter().rposition(|&b| b == b'\n') {
+            let last_line = &trimmed[newline_pos + 1..];
+            return Ok(line_matches_target(last_line, target_rev_id));
+        }
+        // No newline in the buffer yet — either need a bigger window
+        // or the whole file is one line.
+        if take == size {
+            return Ok(line_matches_target(trimmed, target_rev_id));
+        }
+        chunk = chunk.saturating_mul(4);
+    }
+}
+
+fn trim_trailing_newlines(buf: &[u8]) -> &[u8] {
+    let mut end = buf.len();
+    while end > 0 && buf[end - 1] == b'\n' {
+        end -= 1;
+    }
+    &buf[..end]
+}
+
+fn line_matches_target(line: &[u8], target_rev_id: u64) -> bool {
+    let Ok(s) = std::str::from_utf8(line) else {
+        return false;
     };
-    Ok(obj
-        .get("rev_id")
+    let Ok(obj) = serde_json::from_str::<serde_json::Value>(s) else {
+        return false;
+    };
+    obj.get("rev_id")
         .and_then(|v| v.as_u64())
         .map(|r| r == target_rev_id)
-        .unwrap_or(false))
+        .unwrap_or(false)
 }
