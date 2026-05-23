@@ -80,34 +80,75 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 - Long captures: Obama-class (60 k+ revs) takes about 15-30 min wall
   time. fr/Paris-class (20 k revs) takes about 10 min. Plan accordingly.
 
+## Rate-limit coordination
+
+**One capture process per host.** The `capture-history` binary uses a
+polite per-process delay (default 300 ms between batches), but that's
+*per process* — two corpus agents both hitting `en.wikipedia.org` at
+the same time effectively halves the polite delay and risks MW
+throttling. Before claiming any `en/*` row, run
+
+```bash
+pgrep -af "capture-history.*--only en/" ; pgrep -af "scripts/capture_history.py"
+```
+
+and wait for any existing en-targeted capture process to exit before
+starting your own. Different language hosts (e.g. `ja.wikipedia.org`,
+`ru.wikipedia.org`) don't share rate-limit state, so non-en captures
+can run in parallel with each other AND in parallel with an existing
+en capture.
+
+Suggested first-pass order when starting fresh:
+
+1. **Validate rows whose capture is already done** (status `pending —
+   capture-only-step-2-and-3`). These need python_replay + parity-check;
+   no MW API calls.
+2. **Non-en language anchors** (ja, ru, es, pt, he, hi) — different
+   hosts, no contention.
+3. **En articles**, only after `pgrep` shows no other en capture is
+   running.
+
 ## Queue
 
 Status values: `pending`, `claimed-<tag>`, `validated`, `divergence`,
-`failed-<reason>`.
+`failed-<reason>`. The `blocked-on-<thing>` status means "don't pick
+this row up until the named blocker clears."
 
 | lang | page_id | rev_id | title | est. revs | rationale | max_revs hint | status |
 |---|---|---|---|---|---|---|---|
-| en | 534366 | 1354984261 | Barack_Obama | ~60 k | biggest mainstream biography; the canonical "Obama-class" baseline; tests >30 k cap | 100000 | pending |
-| en | 1095706 | 1354664189 | Jesus | ~50 k | contentious religious topic, heavy vandalism + revert pairs | 100000 | pending |
-| en | 5043734 | 1355374251 | Wikipedia (the article) | ~40 k | meta-article; self-referential edit patterns | 100000 | pending |
-| en | 62750956 | 1355596341 | COVID-19_pandemic | ~27 k (captured this session) | tests CJK-tokenizer historical-state — closes the documented divergence from `notes/2026-05-22-first-parity-ratchet.md` if parity holds | 30000 | pending — captured but not yet validated this session |
-| en | 736 | 1355112534 | Albert_Einstein | ~13 k (capture in flight) | biography; well-known size class | 30000 | pending — capture in flight |
-| en | 74998519 | 1355554720 | Gaza_war | TBD | current-event article, heavy vandalism + revert pairs | 30000 | pending — waiting on capture |
-| fr | 681159 | 236388385 | Paris | TBD | fr.wikipedia anchor, non-English mainstream | 30000 | pending — waiting on capture |
-| ja | 71 | (latest) | 日本 | unknown | Japanese-script anchor, often huge | 100000 | pending — need to look up rev_id |
-| ru | 968 | (latest) | Москва | unknown | Russian/Cyrillic anchor | 100000 | pending — need to look up rev_id |
-| es | 6347 | (latest) | España | unknown | Spanish anchor, top-traffic | 100000 | pending — need to look up rev_id |
-| pt | 1631 | (latest) | Brasil | unknown | Portuguese anchor | 100000 | pending — need to look up rev_id |
-| he | 2 | (latest) | ירושלים | unknown | Hebrew/RTL script | 100000 | pending — need to look up rev_id |
-| hi | 7 | (latest) | भारत | unknown | Hindi/Devanagari script | 100000 | pending — need to look up rev_id |
-| en | 6097297 | (latest) | List_of_legendary_creatures_(M) | unknown (huge?) | list-page style; large lifetime-token count | 100000 | pending — useful tail-distribution data |
-| en | 5042916 | (latest) | Climate_change | unknown | high-traffic, heavily-edited, contentious science topic | 100000 | pending |
-| en | 19283 | (latest) | Microsoft | unknown | corporate/biography crossover, many editors | 30000 | pending |
+| en | 62750956 | 1355596341 | COVID-19_pandemic | 26 921 (captured) | tests CJK-tokenizer historical-state — closes the documented divergence from `notes/2026-05-22-first-parity-ratchet.md` if parity holds | (already captured) | pending — capture-only-step-2-and-3 |
+| en | 736 | 1355112534 | Albert_Einstein | ~13 k | biography; well-known size class | 30000 | blocked-on-running-en-capture (main thread is capturing this now; check `pgrep` before claiming, validate via steps 2-3 once file exists) |
+| en | 74998519 | 1355554720 | Gaza_war | unknown | current-event article, heavy vandalism + revert pairs | 30000 | blocked-on-running-en-capture |
+| fr | 681159 | 236388385 | Paris | unknown | fr.wikipedia anchor, non-English mainstream | 30000 | blocked-on-running-en-capture (the running capture process picks this up next; once it's done OR you confirm via pgrep that no fr capture is active, this is safe) |
+| ja | 71 | (latest) | 日本 | unknown | Japanese-script anchor, often huge | 100000 | pending — different host, safe to start now |
+| ru | 968 | (latest) | Москва | unknown | Russian/Cyrillic anchor | 100000 | pending — different host, safe to start now |
+| es | 6347 | (latest) | España | unknown | Spanish anchor, top-traffic | 100000 | pending — different host, safe to start now |
+| pt | 1631 | (latest) | Brasil | unknown | Portuguese anchor | 100000 | pending — different host, safe to start now |
+| he | 2 | (latest) | ירושלים | unknown | Hebrew/RTL script | 100000 | pending — different host, safe to start now |
+| hi | 7 | (latest) | भारत | unknown | Hindi/Devanagari script | 100000 | pending — different host, safe to start now |
+| en | 534366 | 1354984261 | Barack_Obama | ~60 k | biggest mainstream biography; the canonical "Obama-class" baseline; tests >30 k cap | 100000 | blocked-on-running-en-capture |
+| en | 1095706 | 1354664189 | Jesus | ~50 k | contentious religious topic, heavy vandalism + revert pairs | 100000 | blocked-on-running-en-capture |
+| en | 5043734 | 1355374251 | Wikipedia (the article) | ~40 k | meta-article; self-referential edit patterns | 100000 | blocked-on-running-en-capture |
+| en | 6097297 | (latest) | List_of_legendary_creatures_(M) | unknown (huge?) | list-page style; large lifetime-token count | 100000 | blocked-on-running-en-capture |
+| en | 5042916 | (latest) | Climate_change | unknown | high-traffic, heavily-edited, contentious science topic | 100000 | blocked-on-running-en-capture |
+| en | 19283 | (latest) | Microsoft | unknown | corporate/biography crossover, many editors | 30000 | blocked-on-running-en-capture |
 
-(The `(latest)` rev_ids in the language-anchor rows need to be resolved
-before capture — use
-`curl 'https://{lang}.wikipedia.org/w/api.php?action=query&prop=revisions&rvprop=ids&pageids={page_id}&format=json&formatversion=2' | jq '.query.pages[0].revisions[0].revid'`
-and add a row in `parity-fixtures/{lang}/{page_id}/meta.json` first.)
+When the main-thread en capture process exits, **all `blocked-on-running-en-capture`
+rows automatically convert to `pending`** (the corpus agent doesn't
+need permission, just needs to verify via `pgrep` that no other en
+capture has started in the meantime).
+
+The `(latest)` rev_ids in the language-anchor rows need to be resolved
+before capture. Use:
+
+```bash
+curl -s "https://{lang}.wikipedia.org/w/api.php?action=query&prop=revisions&rvprop=ids&pageids={page_id}&format=json&formatversion=2" \
+  | jq '.query.pages[0].revisions[0].revid'
+```
+
+then create `parity-fixtures/{lang}/{page_id}/{rev_id}/meta.json` with
+the shape used by the existing fixtures (see one of the already-captured
+fixtures for the JSON schema).
 
 ## Already in corpus (don't re-capture; here for context)
 
