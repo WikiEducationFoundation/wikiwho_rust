@@ -394,6 +394,13 @@ struct Args {
     /// was caught. Useful for cross-checking against expected
     /// vandalism. Only meaningful with `--full-history`.
     show_spam_ids: bool,
+    /// Print the top-N rev_ids by absolute mismatch in inbound/outbound
+    /// mention count between rust and production. Tells you which
+    /// specific revisions are over- or under-recorded systematically
+    /// — much higher signal than per-token mismatches once the floor
+    /// stops being "everything is wrong." Only meaningful with
+    /// `--full-history`.
+    rev_id_histogram: usize,
 }
 
 fn parse_args() -> Args {
@@ -405,6 +412,7 @@ fn parse_args() -> Args {
         full_history: false,
         show_field_mismatches: 0,
         show_spam_ids: false,
+        rev_id_histogram: 0,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -423,12 +431,19 @@ fn parse_args() -> Args {
                     .expect("--show-field-mismatches requires a positive integer");
             }
             "--show-spam-ids" => out.show_spam_ids = true,
+            "--rev-id-histogram" => {
+                out.rev_id_histogram = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--rev-id-histogram requires a positive integer");
+            }
             "-h" | "--help" => {
                 eprintln!("{}", env!("CARGO_PKG_DESCRIPTION"));
                 eprintln!();
                 eprintln!(
                     "Usage: parity-check [--fixtures DIR] [--show-first-diff] \
                      [--full-history] [--show-field-mismatches N] \
+                     [--show-spam-ids] [--rev-id-histogram N] \
                      [LANG/PAGE_ID ...]"
                 );
                 std::process::exit(0);
@@ -791,6 +806,72 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
         let mut ids = article.spam_ids.clone();
         ids.sort();
         println!("         spam_ids ({}): {:?}", ids.len(), ids);
+    }
+    if args.rev_id_histogram > 0 {
+        // For each rev_id mentioned anywhere in inbound or outbound,
+        // count rust vs production occurrences across all tokens. Sort
+        // by |rust - exp| descending and print the top-N. This isolates
+        // *which revisions* drive the divergence, regardless of which
+        // tokens they affect.
+        use std::collections::BTreeMap;
+        let mut rust_in: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut rust_out: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut exp_in: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut exp_out: BTreeMap<u64, u64> = BTreeMap::new();
+        for word in &rust_words {
+            for &r in &word.inbound {
+                *rust_in.entry(r).or_default() += 1;
+            }
+            for &r in &word.outbound {
+                *rust_out.entry(r).or_default() += 1;
+            }
+        }
+        for rev_map in &rc.revisions {
+            for entry in rev_map.values() {
+                for tok in &entry.tokens {
+                    for &r in &tok.inbound {
+                        *exp_in.entry(r).or_default() += 1;
+                    }
+                    for &r in &tok.outbound {
+                        *exp_out.entry(r).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let mut all_revs: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        all_revs.extend(rust_in.keys());
+        all_revs.extend(rust_out.keys());
+        all_revs.extend(exp_in.keys());
+        all_revs.extend(exp_out.keys());
+        let mut rows: Vec<(u64, u64, u64, u64, u64, i64)> = all_revs
+            .into_iter()
+            .map(|r| {
+                let ri = *rust_in.get(&r).unwrap_or(&0);
+                let ro = *rust_out.get(&r).unwrap_or(&0);
+                let ei = *exp_in.get(&r).unwrap_or(&0);
+                let eo = *exp_out.get(&r).unwrap_or(&0);
+                let abs_diff = (ri as i64 - ei as i64).abs() + (ro as i64 - eo as i64).abs();
+                (r, ri, ro, ei, eo, abs_diff)
+            })
+            .filter(|(_, _, _, _, _, d)| *d > 0)
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.5));
+        let total_divergent = rows.len();
+        println!(
+            "         rev_id-histogram: {} divergent rev_ids (showing top {})",
+            total_divergent,
+            args.rev_id_histogram.min(total_divergent),
+        );
+        println!(
+            "         {:>10}  {:>7} {:>7} {:>7} {:>7}  {:>7}",
+            "rev_id", "r_in", "r_out", "e_in", "e_out", "|diff|",
+        );
+        for (rev, ri, ro, ei, eo, d) in rows.iter().take(args.rev_id_histogram) {
+            println!(
+                "         {:>10}  {:>7} {:>7} {:>7} {:>7}  {:>+7}",
+                rev, ri, ro, ei, eo, d,
+            );
+        }
     }
     if args.show_field_mismatches > 0 {
         // Re-walk and report up to N tokens where in/out diverged. Sets
