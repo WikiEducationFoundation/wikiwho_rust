@@ -20,6 +20,65 @@ Format:
 
 ---
 
+## 2026-05-23 — parity-corpus: large prod-cache divergence on en/COVID-19 and ja/日本 (python ground truth at 100 %) [non-blocking]
+
+**Context:** Captured two new full-history fixtures, ran them through
+`parity-check --full-history --python-replay` and `parity-check
+--full-history` (vs prod-cache). Results:
+
+| Fixture | revs | vs python_replay | vs prod-cache |
+|---|---|---|---|
+| en/62750956 COVID-19_pandemic @ 1355596341 | 26 921 | **100.00 %** (102 897 tokens) | 5.50 % str / 4.16 % all-fields (Δ length = +43) |
+| ja/4821051 日本 @ 109654789 | 801 | **100.00 %** (76 761 tokens) | 6.94 % str / 0.57 % all-fields (Δ length = +33 823; prod-cache only has 42 938 tokens) |
+
+Both match a fresh Python replay byte-for-byte, so this is **not** a
+port bug. Both diverge wildly from prod-cache. The playbook in
+`notes/parity-corpus-wishlist.md` explicitly calls out this case
+("divergence here is NOT a port bug, just a reference-source
+disagreement") — these are the first concrete instances we've recorded.
+
+The ja case is especially striking: prod-cache has only 42 938 tokens
+vs our fresh-replay 76 761, suggesting the wikiwho-api prod cache for
+日本 was last written when the article was ~55 % its current size and
+the rev_id=109654789 lookup is returning that older state. Possible
+explanations:
+
+- prod is serving a cached older snapshot keyed by something other than
+  the queried rev_id;
+- the wikiwho-api Python in production drifted from the Python in
+  `../wikiwho_api/lib/WikiWho/WikiWho/wikiwho.py` that
+  `scripts/python_replay.py` invokes;
+- there's a token-stripping or hide-revision policy in prod that the
+  replay doesn't reproduce.
+
+For COVID-19 the lengths agree to within 43 tokens but the structure is
+shifted — feels like an off-by-one along the rev cascade, not a
+fundamentally different article state.
+
+**Options:**
+- **A. Accept and document.** Treat prod-cache as advisory; the
+  Python replay is the load-bearing ground truth for parity. Mark
+  these fixtures as `divergence — python 100%, prod-cache
+  historical-drift` in the wishlist; do not block the corpus on them.
+- **B. Investigate ja in depth.** Pull the prod-cache token list and
+  diff against `python_replay.json` to identify which rev's editor
+  set / token set is preserved in prod-cache. If it correlates with a
+  specific rev_id, that points at a stale-cache bug we should report
+  to wikiwho-api upstream.
+- **C. Just mark both as `divergence` and move on.** Don't even file
+  an upstream issue — the rewrite cares about python parity, not
+  prod-cache parity.
+
+**Recommendation:** A. The playbook already says prod-cache disagreement
+is expected; with two new concrete cases we have enough evidence that
+prod-cache shouldn't be a corpus gate. Investigating (B) is interesting
+for the report-to-upstream side conversation but isn't blocking the
+rewrite. Recommend codifying A by updating the wishlist playbook to
+distinguish "validated (both 100 %)" from "validated-vs-python
+(prod-cache drift)" as a valid terminal state.
+
+---
+
 ## 2026-05-23 — operational: re-compress legacy raw `.p` files in /pickles/en in place [non-blocking]
 
 **Context:** Production calibration (STORAGE.md §5) showed en's

@@ -116,15 +116,15 @@ this row up until the named blocker clears."
 
 | lang | page_id | rev_id | title | est. revs | rationale | max_revs hint | status |
 |---|---|---|---|---|---|---|---|
-| en | 62750956 | 1355596341 | COVID-19_pandemic | 26 921 (captured) | tests CJK-tokenizer historical-state — closes the documented divergence from `notes/2026-05-22-first-parity-ratchet.md` if parity holds | (already captured) | claimed-parity-bot |
+| en | 62750956 | 1355596341 | COVID-19_pandemic | 26 921 | tests CJK-tokenizer historical-state — vs python 100% (closes the documented divergence from `notes/2026-05-22-first-parity-ratchet.md`); vs prod-cache diverges (5.50% str, Δ+43 length — historical-state drift, see notes/decisions-needed.md 2026-05-23) | (already captured) | divergence — python 100%, prod-cache historical-drift |
 | en | 736 | 1355112534 | Albert_Einstein | ~13 k | biography; well-known size class | 30000 | blocked-on-running-en-capture (main thread is capturing this now; check `pgrep` before claiming, validate via steps 2-3 once file exists) |
 | en | 74998519 | 1355554720 | Gaza_war | unknown | current-event article, heavy vandalism + revert pairs | 30000 | blocked-on-running-en-capture |
 | fr | 681159 | 236388385 | Paris | unknown | fr.wikipedia anchor, non-English mainstream | 30000 | blocked-on-running-en-capture (the running capture process picks this up next; once it's done OR you confirm via pgrep that no fr capture is active, this is safe) |
-| ja | 4821051 | 109654789 | 日本 | unknown | Japanese-script anchor (page_id corrected from 71 via title lookup) | 100000 | claimed-parity-bot |
-| ru | 71 | 152499807 | Москва | unknown | Russian/Cyrillic anchor | 100000 | claimed-parity-bot |
-| es | 972 | 173589609 | España | unknown | Spanish anchor, top-traffic (page_id corrected from 6347 — that ID was missing on es.wp) | 100000 | claimed-parity-bot |
-| pt | 404 | 72290662 | Brasil | unknown | Portuguese anchor (page_id corrected from 1631 via title lookup) | 100000 | claimed-parity-bot |
-| he | 325 | 43259166 | ירושלים | unknown | Hebrew/RTL script (page_id corrected from 2 via title lookup) | 100000 | claimed-parity-bot |
+| ja | 4821051 | 109654789 | 日本 | 801 | Japanese-script anchor (page_id corrected from 71 via title lookup); vs python 100%, vs prod-cache diverges heavily (76761 vs 42938 tokens — prod cache appears to be from a much older state of the article) | 100000 | divergence — python 100%, prod-cache historical-drift |
+| ru | 71 | 152499807 | Москва | 7508 | Russian/Cyrillic anchor; vs python 100%; vs prod-cache not run this session | 100000 | claimed-parity-bot — python 100%, prod-cache pending |
+| es | 972 | 173589609 | España | 10438 | Spanish anchor (page_id corrected from 6347 via title lookup); python_replay running but parity-check not yet executed this session | 100000 | claimed-parity-bot — replay generated, parity pending |
+| pt | 404 | 72290662 | Brasil | 10414 | Portuguese anchor (page_id corrected from 1631 via title lookup) | 100000 | validated |
+| he | 325 | 43259166 | ירושלים | 7183 | Hebrew/RTL script (page_id corrected from 2 via title lookup); vs python 100%; vs prod-cache not run this session | 100000 | claimed-parity-bot — python 100%, prod-cache pending |
 | hi | 59 | 6550353 | भारत | 1928 | Hindi/Devanagari script (page_id corrected from 7 — that ID was missing on hi.wp) | 100000 | validated |
 | en | 534366 | 1354984261 | Barack_Obama | ~60 k | biggest mainstream biography; the canonical "Obama-class" baseline; tests >30 k cap | 100000 | blocked-on-running-en-capture |
 | en | 1095706 | 1354664189 | Jesus | ~50 k | contentious religious topic, heavy vandalism + revert pairs | 100000 | blocked-on-running-en-capture |
