@@ -12,11 +12,12 @@
 //!   `revision_prev`, then the global `paragraphs_ht`.
 //! - `analyse_sentences_in_paragraphs` — full port for the
 //!   unmatched-paragraph subset.
-//! - `analyse_words_in_sentences` — insertion-only path (`text_prev`
-//!   empty), deletion-only short-circuit, and the token-density
-//!   vandalism gate. The general case (Differ-equivalent diff over
-//!   `text_prev` × `text_curr`) is replaced by Myers in
-//!   `ALGORITHM.md §6` and queued for next session.
+//! - `analyse_words_in_sentences` — full port. Insertion-only path
+//!   (`text_prev` empty), deletion-only short-circuit, the token-
+//!   density vandalism gate, and the general case driven by a Rust
+//!   port of Python's `difflib.Differ` (see `differ.rs`). The earlier
+//!   Myers implementation in `diff.rs` is kept around for a future
+//!   revisit — see `notes/diff-algorithm-revisit.md`.
 //! - `determine_authorship` — orchestrator that composes the three
 //!   levels.
 //!
@@ -27,7 +28,7 @@
 //! scratchpad instead — when it falls out of scope the "reset" is
 //! automatic.
 
-use crate::diff;
+use crate::differ;
 use crate::spam::{TOKEN_DENSITY_LIMIT, UNMATCHED_PARAGRAPH};
 use crate::structures::{Article, Hash, MatchedSets, ParagraphId, Revision, SentenceId, TokenId};
 use crate::tokenize::{avg_word_freq, hash_md5, split_paragraphs, split_sentences, split_tokens};
@@ -397,13 +398,14 @@ pub fn analyse_sentences_in_paragraphs(
 ///    early. Outbound recording lives in the post-cascade recorder.
 /// 2. **Insertion-only** (`text_prev` empty): every curr token is
 ///    fresh — allocate them all in document order.
-/// 3. **General case**: run Myers diff over interned `&[u32]` token
-///    ids, then walk the curr sentences consuming the transcript per
-///    `wikiwho.py:631-691`. The DELETE-branch quirk (where a curr
-///    token's value coincides with a deleted prev token's value, so we
-///    consume the prev word AND keep scanning the diff for the curr
-///    word) is ported verbatim — it's load-bearing per
-///    `ALGORITHM.md §4.3`.
+/// 3. **General case**: run our Differ port (`differ::differ_compare`,
+///    Python's Ratcliff/Obershelp matcher) over `text_prev` ×
+///    `text_curr`, then walk the curr sentences consuming the
+///    transcript per `wikiwho.py:631-691`. The DELETE-branch quirk
+///    (where a curr token's value coincides with a deleted prev
+///    token's value, so we consume the prev word AND keep scanning the
+///    diff for the curr word) is ported verbatim — it's load-bearing
+///    per `ALGORITHM.md §4.3`.
 pub fn analyse_words_in_sentences(
     article: &mut Article,
     unmatched_sentences_curr: &[SentenceId],
@@ -477,24 +479,27 @@ pub fn analyse_words_in_sentences(
         return (matched_words_prev, possible_vandalism);
     }
 
-    // General case: Myers diff (wikiwho.py:631-691). See ALGORITHM.md §6.
-    let (a_ids, b_ids, values) = diff::intern_sequences(&text_prev, &text_curr);
-    let ops = diff::myers_diff(&a_ids, &b_ids);
+    // General case: Differ (wikiwho.py:631-691). Port of Python's
+    // `difflib.Differ().compare(text_prev, text_curr)` — see
+    // `differ.rs`'s module doc for why we match Python's
+    // Ratcliff/Obershelp matcher exactly rather than using a true-LCS
+    // matcher like Myers (kept in `diff.rs` for a future revisit).
+    let ops = differ::differ_compare(&text_prev, &text_curr);
 
     // The matching loop consults the transcript by looking up entries
     // by their token VALUE (matching the Python `if word == word_diff[2:]`).
     // We need a mutable working copy so we can mark entries consumed.
     let mut diff_entries: Vec<DiffEntry> = ops
-        .iter()
+        .into_iter()
         .map(|op| {
-            let (kind, value_id) = match *op {
-                diff::DiffOp::Keep(v) => (DiffKind::Keep, v),
-                diff::DiffOp::Delete(v) => (DiffKind::Delete, v),
-                diff::DiffOp::Insert(v) => (DiffKind::Insert, v),
+            let (kind, value) = match op {
+                differ::DiffOp::Keep(v) => (DiffKind::Keep, v),
+                differ::DiffOp::Delete(v) => (DiffKind::Delete, v),
+                differ::DiffOp::Insert(v) => (DiffKind::Insert, v),
             };
             DiffEntry {
                 kind,
-                value: values[value_id as usize].clone(),
+                value,
                 consumed: false,
             }
         })

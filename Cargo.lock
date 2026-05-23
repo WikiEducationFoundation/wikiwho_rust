@@ -209,6 +209,7 @@ version = "0.0.0"
 dependencies = [
  "md-5",
  "regex",
+ "serde_json",
 ]
 
 [[package]]

@@ -10,3 +10,6 @@ description = "Token-level authorship attribution for Wikipedia revisions. Algor
 [dependencies]
 md-5 = { workspace = true }
 regex = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

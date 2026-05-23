@@ -37,8 +37,7 @@ The plan documents several option-without-pick situations. These are now closed;
 | Decision | Pick | Where it's stamped |
 |---|---|---|
 | Implementation language | Rust (Go as bail-out, never Python) | PLAN.md §3 |
-| Diff algorithm | Myers on `&[u32]` interned token ids | ALGORITHM.md §6 |
-| Diff escalation threshold | >0.1% token divergence OR any divergence on known-hard articles | ALGORITHM.md §6 |
+| Diff algorithm | Python `difflib.Differ` port (Ratcliff/Obershelp); Myers kept compiled for a possible later revisit | ALGORITHM.md §6 + notes/diff-algorithm-revisit.md |
 | WhoColor HTML source | MW REST `/page/html` + `html5ever` injection (Option A) | PLAN.md §4.6 |
 | Hash-table persistence | Strategy B, wholesale-rewrite initially, delta-log later | STORAGE.md §4 |
 

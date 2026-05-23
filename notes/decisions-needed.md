@@ -91,6 +91,8 @@ All the rust-only and expected-only rev_ids are **vandalism-and-revert pairs**. 
 
 **Recommendation:** Investigate **how much o_rev_id parity downstream consumers actually need before deciding** — Sage's three consumer projects are the ground truth here. If Dashboard's ArticleViewer can tolerate 14% of tokens having a wrong attribution-revision, ship with Myers. If not, port Differ.
 
+> **Resolved 2026-05-23 (part 4):** chose **A — port Differ**. Investigation of consumer usage showed three of four downstream projects (Dashboard ArticleViewer, XTools Authorship/Blame, WhoWroteThat gadget) render attribution per-token — coloring individual tokens by editor — so the 14% per-token `o_rev_id` divergence under Myers would be visibly wrong. Only Impact Visualizer aggregates over revision ranges (drift, not visible). The Differ port (`crates/wikiwho-attribute/src/differ.rs`) is a faithful port of `difflib.SequenceMatcher` + `difflib.Differ.compare`, validated against Python subprocess output on 22 curated cases including autojunk, `_fancy_replace`, and vandalism patterns. After threading it into the cascade, all four captured-history fixtures (en/24544 Photosynthesis, en/79023819 Israel-Hamas war, simple/27263 Wikipedia, zh/1686258 中国) hit **100.00%** on every field (str / o_rev_id / inbound / outbound / all-fields). Myers is kept compiled in `diff.rs` for a possible later revisit — see `notes/diff-algorithm-revisit.md` for the rationale and methodology.
+
 ---
 
 ## 2026-05-22 — handling historical-tokenization divergence [non-blocking]

@@ -27,6 +27,7 @@
 
 pub mod cascade;
 pub mod diff;
+pub mod differ;
 pub mod pipeline;
 pub mod spam;
 pub mod structures;

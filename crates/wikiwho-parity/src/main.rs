@@ -14,9 +14,10 @@
 //! cascade adds metadata (token_id, origin_rev_id, in, out) that
 //! single-rev fixtures cannot validate.
 //!
-//! To improve the metric meaningfully we need either (a) multi-rev
-//! fixtures (rev_1..rev_N feed) so the diff path matters, or (b) a
-//! Differ-equivalent Myers tie-breaker — see `notes/decisions-needed.md`.
+//! Single-rev fixtures don't exercise the cascade's general-case Differ
+//! path (text_prev is empty for the first revision). The full-history
+//! mode (`--full-history`) replays every revision in order and is the
+//! real algorithm-parity ratchet.
 //!
 //! Usage:
 //!   parity-check                       # run against all fixtures
@@ -222,9 +223,9 @@ impl Tally {
                  reference (production wikiwho-api by default, or a fresh \
                  Python run with --python-replay). The all-fields \
                  percentage is the real algorithm-parity number — \
-                 anything below 100% is either a Rust-Myers-vs-Python-\
-                 Differ divergence (intrinsic until we port Differ) or a \
-                 bug to investigate."
+                 anything below 100% (vs Python ground truth) is a bug \
+                 in the port, since the Rust cascade now uses a faithful \
+                 port of Python's Differ."
             );
         } else {
             println!(

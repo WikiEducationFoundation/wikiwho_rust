@@ -328,6 +328,20 @@ problem.
 > tokens diverge across the parity corpus, OR any divergence in the
 > known-hard articles (Obama, Trump, COVID-19, Israel–Hamas war,
 > Hitler, Jesus, Wikipedia itself).
+>
+> **Re-resolved 2026-05-23:** the >0.1% trip-wire fired. With Python-
+> replay ground truth, Myers diverged by 3-4% in token allocations,
+> which cascaded to ~14% per-token `o_rev_id` mismatches on
+> Photosynthesis. Three of four consumers (Dashboard ArticleViewer,
+> XTools, WhoWroteThat) render attribution per-token, so the
+> divergence is consumer-visible. Switched to a faithful port of
+> Python's `difflib.Differ` (Ratcliff/Obershelp matcher) — see
+> `crates/wikiwho-attribute/src/differ.rs`. All four captured-history
+> fixtures now hit 100.00% all-fields against Python ground truth.
+> Myers stays compiled in `diff.rs` but is no longer wired into the
+> cascade; the open question of whether Myers or Differ produces
+> *better* human-comprehensible attribution lives in
+> `notes/diff-algorithm-revisit.md`.
 
 ## 7. Editor identity
 
