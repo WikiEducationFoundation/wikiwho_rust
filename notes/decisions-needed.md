@@ -20,6 +20,73 @@ Format:
 
 ---
 
+## 2026-05-23 — operational: re-compress legacy raw `.p` files in /pickles/en in place [non-blocking]
+
+**Context:** Production calibration (STORAGE.md §5) showed en's
+`/pickles/en/*.p` files include a mix of gzipped (most) and raw (some).
+The raw ones predate the `gzip-6` write path at
+`api/utils_pickles.py:103`. Magic-byte sampling of the captured fixtures
+suggested *most* of en is already gzipped, but we did not run the
+broader per-language sampling script that would actually count it.
+
+If the raw fraction is non-trivial — say 10 % or more of en's 8.2 M
+articles — a one-shot read-and-re-write sweep through the compressed
+path would shrink en's footprint with no rewrite work. Even a 5 %
+shrinkage on 1.88 TB is ~95 GB recovered.
+
+This is **operational maintenance**, not part of the algorithm rewrite.
+It can be done independently and in parallel.
+
+**Options:**
+- **A. Sample first, then decide.** Run the magic-byte counting script
+  (per-language sampling, 200 random files each) to size the actual win
+  before scheduling. ~5 min of read I/O per language.
+- **B. Just do it.** Walk `/pickles/en` and for any file whose first 2
+  bytes aren't `\x1f\x8b`, read+re-write it through `pickle_dump`. Idempotent
+  (touches gzipped files harmlessly, no-ops would be detected by the
+  first 2 bytes). ~hours to weeks depending on I/O throttling.
+- **C. Defer.** We have 2× headroom (7 TB used / 14.7 TB allocated).
+  No urgency until the rewrite cutover starts consuming the headroom
+  for parallel-format data.
+
+**Recommendation:** **A.** Five minutes of sampling tells us whether B
+is worth doing at all.
+
+---
+
+## 2026-05-23 — quantify per-pickle-attribute byte breakdown [non-blocking]
+
+**Context:** STORAGE.md §5.5 assumes hash tables are 20-40 % of an
+article's compressed bytes, but we don't actually know — pickle wraps
+the whole `Wikiwho` object opaquely. The right way to settle this is to
+load a sample big article and call `pympler.asizeof` (or
+`len(pickle.dumps(attr))` if pympler isn't installed) on each top-level
+attribute: `tokens`, `sentences`, `paragraphs`, `revisions`,
+`paragraphs_ht`, `sentences_ht`, `spam_ids`, `ordered_revisions`.
+
+The answer informs two specific design choices in STORAGE.md:
+
+1. Whether `hashtables.bin` deserves the per-article fourth file at all
+   (if hash tables are 50 % of the bytes, it's a major slice; if 5 %,
+   they could be inlined).
+2. Whether `revisions.bin` deserves the most optimization attention
+   (revisions list dominating vs token arena dominating).
+
+**Options:**
+- **A. Run the breakdown script on production now** — needs production
+  access (Sage has it) and the wikiwho venv. ~2 min per sample article.
+- **B. Defer until we're actually writing the storage crate** and use
+  the breakdown to make specific format choices. The 20-40 % estimate
+  in STORAGE.md §5.5 is conservative enough to start design without.
+
+**Recommendation:** **B.** Storage implementation starts with the
+framework (file headers, varint encoding, mmap reader) regardless of
+byte-distribution details; the breakdown matters when we tune compressor
+choice or decide whether to inline small `hashtables.bin` into another
+file. Surface again when we hit that fork.
+
+---
+
 ## 2026-05-22 — inbound/outbound list inflation on multi-rev replay [non-blocking]
 
 **Context:** First full-history parity run lands. Israel-Hamas war (2 revs) and 中国 (7 revs) replay cleanly — 41/41 token strings match, 39/41 all-fields (the 2 misses are Myers vs Differ on duplicate `{{` tokens, exactly the documented divergence in `ALGORITHM.md §6`). But simple Wikipedia (3755 processed revs, 28 hidden, 90 spam) shows a much worse pattern: token strings 100% (4495/4495), o_rev_id 91.58%, but inbound/outbound only 1.94%. Spot-checking shows our `inbound` and `outbound` lists are roughly **twice as long** as Python's — we record drop/re-add events Python doesn't. Example: token `"{{"` (id 0) has our `inbound.len=100` vs Python's `49`. Affected revs include known vandalism-and-revert pairs (e.g. rev 6330300 "Replaced content with F U C K", reverted at 6330301), and our code processes both while Python's expected output doesn't record them.

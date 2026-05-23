@@ -360,50 +360,125 @@ compaction folds the log into the base, same as for `revisions.bin`.
 
 ## 5. Total size estimates
 
-Per [STORAGE.md §1](#1-directory-layout)'s shape, for an enwiki
-average article (~100 revisions, ~3K lifetime tokens):
+> **Calibrated against production, 2026-05-23.** An earlier version of
+> this section assumed an 18 KB compressed average article and ~100
+> revisions per article. Production measurements (one of the three 4.9 TB
+> cinder volumes on `wikiwho01`, sampled with the Claude session that
+> drove this revision) show the real averages are ~10× larger; the
+> numbers below replace the hand-waved ones.
 
-| File | Approx size |
-|------|-------------|
-| meta.json | 500 B |
-| strings.bin | 5 KB (compressed) |
-| tokens.bin | 8 KB |
-| revisions.bin | 3 KB |
-| hashtables.bin | 2 KB |
-| **Total** | **~18 KB** per article |
+### 5.1 Current production footprint
 
-For Obama (57K revs, ~400K lifetime tokens):
+Measured on `/dev/sdc` (one of three identical 4.9 TB cinder volumes;
+~2.0 TB used on this one, languages alphabetically distributed across
+the three):
 
-| File | Approx size |
-|------|-------------|
-| meta.json | 600 B |
-| strings.bin | 1.5 MB |
-| tokens.bin | 6 MB |
-| revisions.bin | 70 MB |
-| hashtables.bin | 30 MB |
-| **Total** | **~110 MB** (compressed) |
+| Language | Articles on this volume | Bytes | Avg / article |
+|----------|------------------------:|------:|--------------:|
+| en | 8 178 631 | 1.88 TB | **224 KB** |
+| he | 416 104 | 17.5 GB | 41 KB |
+| cy | 287 917 | 17.8 GB | 60 KB |
+| da | 323 975 | 6.8 GB | 20 KB |
+| bg | 314 555 | 8.2 GB | 25 KB |
+| ku | 94 086 | 0.84 GB | 8.8 KB |
+| ur | 1 291 110 | 6.6 GB | 5.0 KB |
+| (15 other languages here) | … | … | 10-30 KB |
 
-Compare current Obama pickle, estimated 15–25 MB compressed. We're
-trading some storage size for **much** better random-revision access
-(O(log N) instead of O(article)) and incremental updates.
+en is the outlier by a large margin: 94 % of this volume's bytes despite
+being one of 22 languages on it. The other two volumes hold the
+remaining ~45 languages. Total production usage across all three
+volumes is approximately **7 TB out of 14.7 TB allocated** — so the
+rewrite has roughly 2× headroom before needing more storage.
 
-If storage size is an issue for the absolute worst-case articles, we
-can drop `hashtables.bin` to a sampled or compressed form (only keep
-hashes that have occurred more than once) — but this should be a
-follow-up optimization, not the initial design.
+The pickle format is gzipped Python pickle, transparent: `pickle_load`
+(`api/utils_pickles.py:118`) tries gzip first and falls back to raw
+pickle for legacy files. Within en specifically, *most* files are
+gzipped on disk (verified by magic-byte sampling of the captured
+fixtures) — the very oldest files may still be raw, but they are a
+minority. The 224 KB / article average is the compressed average.
 
-For all of enwiki (~7M articles), assuming the 18 KB average scales
-roughly:
+### 5.2 Per-revision cost
 
-- Average article × 7M ≈ **130 GB**
-- Plus the ~1000 Obama-class articles × 100 MB ≈ **100 GB**
-- **Total enwiki: ~250 GB**
+Measured on the captured-parity fixtures:
 
-This is more than the current ~120 GB enwiki estimate, mostly because
-of the hash table file. Acceptable given the read-latency win. If
-total storage is constrained, dropping `hashtables.bin` for read-only
-mirrors (a separate ingestion process maintains the hash tables;
-read-only nodes don't need them) would get back to ~150 GB enwiki.
+| Fixture | revs | gzipped on disk | KB / rev |
+|---------|-----:|----------------:|---------:|
+| en/79023819 Israel–Hamas war (raw, gz6 estimated) | 2 | 1.2 KB | 0.57 |
+| en/24544 Photosynthesis | 5 495 | 2.7 MB | 0.49 |
+| en/46827 Jesse_Owens | 6 461 | 2.3 MB | 0.37 |
+| en/22989 Paris | 20 453 | 13.4 MB | 0.67 |
+| en/2731583 Adolf_Hitler | 28 417 | 20.6 MB | 0.73 |
+
+Production averages **0.5-0.7 KB / revision compressed**. Linear in
+revision count (the per-revision token-sequence dominates); per-article
+fixed costs (`meta.json`, file inodes, directory shards) only matter
+below ~100 revs.
+
+### 5.3 Rewrite target
+
+Two factors should let the rewrite beat the current per-rev cost
+slightly:
+
+1. **Zstd-9 vs gzip-6.** On Wikipedia-like text + rev-id sequence data,
+   zstd-9 typically compresses 15-30 % tighter than gzip-6.
+2. **No Python pickle overhead.** Pickle carries class refs, attribute
+   dicts, and list-of-string headers; our binary format is the actual
+   bytes the algorithm needs. Even before compression, the binary form
+   is denser.
+
+Net target: **0.3-0.4 KB / revision compressed**. Per-fixture targets:
+
+| Fixture | revs | prod (gz) | rewrite target |
+|---------|-----:|----------:|---------------:|
+| en/24544 Photosynthesis | 5 495 | 2.7 MB | ~1.6 MB |
+| en/22989 Paris | 20 453 | 13.4 MB | ~7 MB |
+| en/2731583 Adolf_Hitler | 28 417 | 20.6 MB | ~10 MB |
+| en/534366 Barack_Obama (extrapolated) | ~57 000 | ~40 MB | ~20 MB |
+| Top-of-tail List_of_… class (observed) | ~600 000 | ~400 MB | ~200 MB |
+
+`hashtables.bin` (Strategy B, §4) adds bytes; current production may
+already serialize hash tables inside the pickle, so this likely doesn't
+*add* to the on-disk total — it just exposes what's there. A
+conservative budget puts hash tables at 20-40 % of per-article cost.
+Even with that, the rewrite stays at or below current production per
+article.
+
+The `wikiwho-parity` binary will grow a `--storage-size` mode once the
+storage crate lands, so per-fixture rewrite-vs-prod bytes are tracked
+continuously as a regression metric alongside parity.
+
+### 5.4 Total volume budget
+
+Two scenarios:
+
+| Scenario | en | Other ~66 langs | Total |
+|----------|---:|----------------:|------:|
+| Rewrite matches production (no gain) | 1.9 TB | ~5 TB | ~7 TB |
+| Rewrite beats production by 30-50 % | 0.9-1.3 TB | 3-4 TB | 4-5 TB |
+
+Either way, comfortably under the 14.7 TB allocated; no storage request
+needed for the rewrite cutover. We have ~2× headroom in the worst case.
+
+### 5.5 Where the bytes go (still hand-waved)
+
+Without an in-pickle attribute breakdown we don't yet know what fraction
+of the per-article cost is tokens vs sentences/paragraphs vs revisions
+vs hash tables vs spam list. A sample article unpickled with
+`pympler.asizeof` would close that gap and inform whether
+`hashtables.bin`'s size estimate (currently a guess of 20-40 % of total)
+is right. Queued as a non-blocking follow-up; not required to start
+storage implementation.
+
+### 5.6 Operational headroom (separate from the rewrite)
+
+If a significant fraction of en's `.p` files are still legacy raw
+pickle (i.e., predate the `gzip-6` write path at
+`api/utils_pickles.py:103`), running a one-shot read-and-re-write sweep
+would compress them in place and recover free disk. The magic-byte
+sample in the session conversation suggested *most* en files are
+already gzipped, so the upside here may be small; sample more broadly
+before scheduling the sweep if it ever matters. Tracked as a non-blocking
+operational follow-up in `notes/decisions-needed.md`.
 
 ## 6. What we are NOT doing
 
