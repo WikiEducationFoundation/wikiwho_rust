@@ -177,12 +177,12 @@ pub struct Article {
     // ---- revisions ----
     pub revisions: HashMap<RevId, Revision>,
     pub ordered_revisions: Vec<RevId>,
-    /// Id of the revision currently being analysed (or last processed).
-    pub revision_curr: RevId,
-    /// Id of the previous successfully-processed revision; `0` before
-    /// the first revision lands. Note: spam-detected revisions do NOT
-    /// advance this pointer (`wikiwho.py:96`, `:172`).
-    pub revision_prev: RevId,
+    /// Id of the most-recent successfully processed revision (the one
+    /// the next call should use as `revision_prev`). `0` before the
+    /// first revision lands. Vandalism-detected revisions do NOT
+    /// advance this pointer (`wikiwho.py:96`, `:172`), which is what
+    /// keeps spam invisible to later revisions' matching cascade.
+    pub last_good_rev_id: RevId,
 
     // ---- cross-revision hash tables ----
     /// Every paragraph hash ever seen in the article. Lets a paragraph

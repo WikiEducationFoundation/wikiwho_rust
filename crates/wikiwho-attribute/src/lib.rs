@@ -15,11 +15,14 @@
 //!   shared references; no `matched` flag on nodes (per-iteration
 //!   `MatchedSets` will replace it).
 //! - `spam` — constants + length-shrink + hash-match vandalism
-//!   checks. The token-density check is wired in once the cascade
-//!   exists.
-//! - The matching cascade (`determine_authorship` and its
-//!   sub-functions) is NOT YET PORTED.
+//!   checks. The token-density check is wired in by `cascade`.
+//! - `cascade` — paragraph + sentence + (insertion-only) token
+//!   levels and the `determine_authorship` orchestrator. The general
+//!   token-cascade case (Differ→Myers diff) is queued for the next
+//!   session.
 
+pub mod cascade;
+pub mod pipeline;
 pub mod spam;
 pub mod structures;
 pub mod tokenize;
