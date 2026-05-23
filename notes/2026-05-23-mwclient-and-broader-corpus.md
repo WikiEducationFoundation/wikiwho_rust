@@ -102,9 +102,28 @@ job with a higher cap):
   `notes/2026-05-23-differ-port.md` is essentially closed at this
   cap level. Five small-to-medium-sized articles broadened the
   corpus by ~245 % (31 885 → 77 605 tokens compared). All hit 100 %.
-- No new entries to `notes/decisions-needed.md` this session — the
-  work was all within plan scope (mwclient and the wire-format
-  builder are both pre-listed in PLAN.md §9).
+
+**Storage calibration (mid-session conversation, separate commit):**
+
+While the captures were running, Sage and I cross-checked STORAGE.md
+§5's hand-waved estimates against production. The "18 KB compressed
+average article × 7 M articles ≈ 250 GB for enwiki" target was off by
+~10×: en is actually **1.88 TB across 8.18 M articles, avg 224 KB
+compressed**. Across all three cinder volumes prod uses ~7 TB / 14.7
+TB allocated. Per-revision cost in production is **0.5-0.7 KB
+compressed** (calibrated against the 5 captured en fixtures).
+
+STORAGE.md §5 is fully rewritten with the calibrated numbers and a
+per-fixture rewrite-target table. Two non-blocking follow-ups queued
+in `notes/decisions-needed.md`:
+
+- Compress remaining legacy raw `.p` files in `/pickles/en` in place
+  (sample first to size the win).
+- Quantify the per-pickle-attribute byte breakdown when storage format
+  tuning starts.
+
+Net: the rewrite has ~2× headroom even worst case; no storage
+request needed for cutover.
 
 **Next session likely starts with:**
 
