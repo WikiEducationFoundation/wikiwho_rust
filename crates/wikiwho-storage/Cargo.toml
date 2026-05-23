@@ -1,0 +1,18 @@
+[package]
+name = "wikiwho-storage"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "On-disk blob format for token-level authorship state. Implements the layout in STORAGE.md and supports the lazy single-revision read path."
+
+[dependencies]
+crc32fast = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+wikiwho-attribute = { path = "../wikiwho-attribute" }
+
+[dev-dependencies]
+tempfile = "3"

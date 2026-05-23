@@ -141,6 +141,13 @@ pub struct Revision {
     /// Tokens originally added in *this* revision. Set by the cascade
     /// (`wikiwho.py:627`, `:673`, `:688`).
     pub original_adds: u32,
+    /// Pre-computed flat token sequence for this revision in document
+    /// order. Populated by the storage layer after loading from disk
+    /// (where paragraph/sentence arenas are not persisted). When
+    /// `Some`, `iter_rev_tokens` returns the cached sequence directly.
+    /// `None` in the algorithm path — `iter_rev_tokens` then walks
+    /// paragraphs → sentences → words as in the Python reference.
+    pub token_sequence_override: Option<Vec<TokenId>>,
 }
 
 /// Per-iteration scratch state. Replaces the Python's `matched: bool`
@@ -286,6 +293,13 @@ impl Article {
 /// sentence counter reset per paragraph).
 pub fn iter_rev_tokens(article: &Article, revision: &Revision) -> Vec<TokenId> {
     use std::collections::HashMap;
+
+    // Fast path for storage-loaded articles: the sequence was
+    // captured at write time and there's no paragraph/sentence state
+    // to walk.
+    if let Some(seq) = revision.token_sequence_override.as_ref() {
+        return seq.clone();
+    }
 
     let mut tokens = Vec::new();
     let mut p_seen: HashMap<&Hash, usize> = HashMap::new();
