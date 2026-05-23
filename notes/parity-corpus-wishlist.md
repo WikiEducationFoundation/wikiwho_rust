@@ -125,7 +125,7 @@ this row up until the named blocker clears."
 | es | 972 | 173589609 | España | unknown | Spanish anchor, top-traffic (page_id corrected from 6347 — that ID was missing on es.wp) | 100000 | claimed-parity-bot |
 | pt | 404 | 72290662 | Brasil | unknown | Portuguese anchor (page_id corrected from 1631 via title lookup) | 100000 | claimed-parity-bot |
 | he | 325 | 43259166 | ירושלים | unknown | Hebrew/RTL script (page_id corrected from 2 via title lookup) | 100000 | claimed-parity-bot |
-| hi | 59 | 6550353 | भारत | unknown | Hindi/Devanagari script (page_id corrected from 7 — that ID was missing on hi.wp) | 100000 | claimed-parity-bot |
+| hi | 59 | 6550353 | भारत | 1928 | Hindi/Devanagari script (page_id corrected from 7 — that ID was missing on hi.wp) | 100000 | validated |
 | en | 534366 | 1354984261 | Barack_Obama | ~60 k | biggest mainstream biography; the canonical "Obama-class" baseline; tests >30 k cap | 100000 | blocked-on-running-en-capture |
 | en | 1095706 | 1354664189 | Jesus | ~50 k | contentious religious topic, heavy vandalism + revert pairs | 100000 | blocked-on-running-en-capture |
 | en | 5043734 | 1355374251 | Wikipedia (the article) | ~40 k | meta-article; self-referential edit patterns | 100000 | blocked-on-running-en-capture |
