@@ -28,6 +28,10 @@
 //!   `Article` state into the rev_content JSON shape downstream
 //!   consumers expect. Lives here (not in a server crate) because the
 //!   shape is pure algorithm-output, no HTTP.
+//! - `whocolor` — per-revision data builder for API.md §7-8 (tokens
+//!   with conflict_score + age_seconds, revisions chain, biggest
+//!   conflict). Pure algorithm output; HTML span injection lives
+//!   alongside the server crate.
 
 pub mod cascade;
 pub mod diff;
@@ -37,3 +41,4 @@ pub mod response;
 pub mod spam;
 pub mod structures;
 pub mod tokenize;
+pub mod whocolor;
