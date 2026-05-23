@@ -75,6 +75,14 @@ Active implementation. **Always read the newest file under `notes/` before start
 
 `git log --oneline | head` gives the high-level trajectory at a glance.
 
+### Parallel workstreams
+
+The main development thread (this `CLAUDE.md`'s posture) drives algorithm / storage / server / ingest work. A second workstream — **growing the parity corpus** — is parallelizable and runs from a different work queue:
+
+- **Queue file:** `notes/parity-corpus-wishlist.md` with rough-priority-ordered article entries and a playbook for capture → python_replay → validate → commit.
+- **Scope:** the corpus agent should touch only the wishlist file, `notes/decisions-needed.md`, captured fixtures (gitignored), and rarely `scripts/*.py`. It must **not** touch crates under `crates/` — if a fixture exposes a port bug or design fork, the corpus agent files an entry in `notes/decisions-needed.md` for the main thread to pick up.
+- **Coordination:** the wishlist's `claimed-<tag>` status entries are how multiple corpus agents avoid double-processing. The main thread can ignore the wishlist's churn entirely.
+
 ## What this project is
 
 A planned from-scratch rewrite of [WikiWho](https://wikiwho-api.wmcloud.org/) — a per-token authorship attribution service for Wikipedia articles — that backs four production consumers: the Wiki Education Dashboard's ArticleViewer, the Impact Visualizer, the WhoWroteThat gadget (Wikimedia), and XTools' Authorship + Blame tools (Wikimedia). The current production implementation lives at `../wikiwho_api` (Django 1.11 / Python 2-3 hybrid / Celery / RabbitMQ / Memcached / Postgres / ~5 TB of gzipped pickles across three Cinder volumes on Wikimedia Cloud). The rewrite targets a single statically-linked Rust binary with mmap'd columnar storage.
