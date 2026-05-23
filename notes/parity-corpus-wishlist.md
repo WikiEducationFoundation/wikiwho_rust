@@ -116,7 +116,7 @@ this row up until the named blocker clears."
 
 | lang | page_id | rev_id | title | est. revs | rationale | max_revs hint | status |
 |---|---|---|---|---|---|---|---|
-| en | 62750956 | 1355596341 | COVID-19_pandemic | 26 921 (captured) | tests CJK-tokenizer historical-state — closes the documented divergence from `notes/2026-05-22-first-parity-ratchet.md` if parity holds | (already captured) | pending — capture-only-step-2-and-3 |
+| en | 62750956 | 1355596341 | COVID-19_pandemic | 26 921 (captured) | tests CJK-tokenizer historical-state — closes the documented divergence from `notes/2026-05-22-first-parity-ratchet.md` if parity holds | (already captured) | claimed-parity-bot |
 | en | 736 | 1355112534 | Albert_Einstein | ~13 k | biography; well-known size class | 30000 | blocked-on-running-en-capture (main thread is capturing this now; check `pgrep` before claiming, validate via steps 2-3 once file exists) |
 | en | 74998519 | 1355554720 | Gaza_war | unknown | current-event article, heavy vandalism + revert pairs | 30000 | blocked-on-running-en-capture |
 | fr | 681159 | 236388385 | Paris | unknown | fr.wikipedia anchor, non-English mainstream | 30000 | blocked-on-running-en-capture (the running capture process picks this up next; once it's done OR you confirm via pgrep that no fr capture is active, this is safe) |
