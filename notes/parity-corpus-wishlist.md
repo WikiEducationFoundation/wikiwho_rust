@@ -120,12 +120,12 @@ this row up until the named blocker clears."
 | en | 736 | 1355112534 | Albert_Einstein | ~13 k | biography; well-known size class | 30000 | blocked-on-running-en-capture (main thread is capturing this now; check `pgrep` before claiming, validate via steps 2-3 once file exists) |
 | en | 74998519 | 1355554720 | Gaza_war | unknown | current-event article, heavy vandalism + revert pairs | 30000 | blocked-on-running-en-capture |
 | fr | 681159 | 236388385 | Paris | unknown | fr.wikipedia anchor, non-English mainstream | 30000 | blocked-on-running-en-capture (the running capture process picks this up next; once it's done OR you confirm via pgrep that no fr capture is active, this is safe) |
-| ja | 71 | (latest) | 日本 | unknown | Japanese-script anchor, often huge | 100000 | pending — different host, safe to start now |
-| ru | 968 | (latest) | Москва | unknown | Russian/Cyrillic anchor | 100000 | pending — different host, safe to start now |
-| es | 6347 | (latest) | España | unknown | Spanish anchor, top-traffic | 100000 | pending — different host, safe to start now |
-| pt | 1631 | (latest) | Brasil | unknown | Portuguese anchor | 100000 | pending — different host, safe to start now |
-| he | 2 | (latest) | ירושלים | unknown | Hebrew/RTL script | 100000 | pending — different host, safe to start now |
-| hi | 7 | (latest) | भारत | unknown | Hindi/Devanagari script | 100000 | pending — different host, safe to start now |
+| ja | 71 | 16733166 | 日本 | unknown | Japanese-script anchor, often huge | 100000 | claimed-parity-bot |
+| ru | 71 | 152499807 | Москва | unknown | Russian/Cyrillic anchor (page_id corrected from 968 — that ID was missing on ru.wp) | 100000 | claimed-parity-bot |
+| es | 972 | 173589609 | España | unknown | Spanish anchor, top-traffic (page_id corrected from 6347 — that ID was missing on es.wp) | 100000 | claimed-parity-bot |
+| pt | 1631 | 57665063 | Brasil | unknown | Portuguese anchor | 100000 | claimed-parity-bot |
+| he | 2 | 41668911 | ירושלים | unknown | Hebrew/RTL script | 100000 | claimed-parity-bot |
+| hi | 59 | 6550353 | भारत | unknown | Hindi/Devanagari script (page_id corrected from 7 — that ID was missing on hi.wp) | 100000 | claimed-parity-bot |
 | en | 534366 | 1354984261 | Barack_Obama | ~60 k | biggest mainstream biography; the canonical "Obama-class" baseline; tests >30 k cap | 100000 | blocked-on-running-en-capture |
 | en | 1095706 | 1354664189 | Jesus | ~50 k | contentious religious topic, heavy vandalism + revert pairs | 100000 | blocked-on-running-en-capture |
 | en | 5043734 | 1355374251 | Wikipedia (the article) | ~40 k | meta-article; self-referential edit patterns | 100000 | blocked-on-running-en-capture |
