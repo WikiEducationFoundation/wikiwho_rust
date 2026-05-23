@@ -24,6 +24,10 @@
 //!   orchestrator.
 //! - `pipeline` — `Article::analyse_revision` wires the per-revision
 //!   spam checks, cascade, and recorder into a single entry point.
+//! - `response` — wire-format builders (API.md §1-6). Converts in-memory
+//!   `Article` state into the rev_content JSON shape downstream
+//!   consumers expect. Lives here (not in a server crate) because the
+//!   shape is pure algorithm-output, no HTTP.
 
 pub mod cascade;
 pub mod diff;
