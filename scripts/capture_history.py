@@ -126,18 +126,30 @@ def normalize_revision(rev):
     https://www.mediawiki.org/wiki/API:Revisions; we only consume the
     subset described in this script's module docstring. The output is
     a plain dict ready for json.dumps.
+
+    formatversion quirks (we use formatversion=2):
+      - `minor` is always present as a bool (True/False). formatversion=1
+        omitted the key when the edit wasn't minor, so the natural
+        "minor" in rev check would only work there. Use the value.
+      - `userhidden`, `commenthidden`, `suppressed`, `sha1hidden` still
+        use presence-when-true semantics in v2 (omitted when the flag
+        isn't set). The "X" in rev check is fine for these.
+      - `texthidden` lives under `slots.main.texthidden = True` in v2,
+        never at the top level; we check the slot below.
     """
-    text_hidden = "texthidden" in rev or "textmissing" in rev or "suppressed" in rev
+    slot = (rev.get("slots") or {}).get("main") or {}
+    text_hidden = (
+        slot.get("texthidden") is True
+        or "textmissing" in rev
+        or "suppressed" in rev
+    )
     text = ""
     if not text_hidden:
-        # rvslots=main puts content under slots.main.* in formatversion=2.
-        try:
-            text = rev["slots"]["main"]["content"]
-        except (KeyError, TypeError):
-            # Some legacy responses surface the content directly as "*".
-            text = rev.get("*", "")
-            if not text and rev.get("slots", {}).get("main", {}).get("texthidden") is not None:
-                text_hidden = True
+        # rvslots=main puts content under slots.main.content in v2 and
+        # slots.main.* in legacy responses; tolerate both.
+        text = slot.get("content")
+        if text is None:
+            text = slot.get("*") or rev.get("*", "")
 
     user_hidden = "userhidden" in rev
     comment_hidden = "commenthidden" in rev or "suppressed" in rev
@@ -148,7 +160,7 @@ def normalize_revision(rev):
         "timestamp":   rev["timestamp"],
         "sha1":        rev.get("sha1"),
         "comment":     None if comment_hidden else rev.get("comment"),
-        "minor":       "minor" in rev,
+        "minor":       bool(rev.get("minor", False)),
         "user_id":     None if user_hidden else rev.get("userid"),
         "user_name":   None if user_hidden else rev.get("user"),
         "text":        text,

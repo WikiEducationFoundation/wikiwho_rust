@@ -13,6 +13,7 @@ venv/
 # Local Claude settings (per-machine, not shared)
 .claude/settings.local.json
 .claude/projects/
+.claude/scheduled_tasks.lock
 
 # Editor / OS noise
 .DS_Store

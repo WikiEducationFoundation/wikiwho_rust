@@ -385,6 +385,15 @@ struct Args {
     filters: Vec<String>,
     show_first_diff: bool,
     full_history: bool,
+    /// Print up to N tokens whose inbound/outbound list disagrees with
+    /// production, showing the symmetric difference of rev_ids. Useful
+    /// for tracing inflation patterns. Only meaningful with
+    /// `--full-history`.
+    show_field_mismatches: usize,
+    /// Print every rev_id our cascade flagged as spam, in the order it
+    /// was caught. Useful for cross-checking against expected
+    /// vandalism. Only meaningful with `--full-history`.
+    show_spam_ids: bool,
 }
 
 fn parse_args() -> Args {
@@ -394,6 +403,8 @@ fn parse_args() -> Args {
         filters: Vec::new(),
         show_first_diff: false,
         full_history: false,
+        show_field_mismatches: 0,
+        show_spam_ids: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -405,12 +416,20 @@ fn parse_args() -> Args {
             }
             "--show-first-diff" => out.show_first_diff = true,
             "--full-history" => out.full_history = true,
+            "--show-field-mismatches" => {
+                out.show_field_mismatches = args
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--show-field-mismatches requires a positive integer");
+            }
+            "--show-spam-ids" => out.show_spam_ids = true,
             "-h" | "--help" => {
                 eprintln!("{}", env!("CARGO_PKG_DESCRIPTION"));
                 eprintln!();
                 eprintln!(
                     "Usage: parity-check [--fixtures DIR] [--show-first-diff] \
-                     [--full-history] [LANG/PAGE_ID ...]"
+                     [--full-history] [--show-field-mismatches N] \
+                     [LANG/PAGE_ID ...]"
                 );
                 std::process::exit(0);
             }
@@ -768,9 +787,70 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
             println!("         first str diff @ {}: rust={:?} expected={:?}", i, got, exp);
         }
     }
+    if args.show_spam_ids {
+        let mut ids = article.spam_ids.clone();
+        ids.sort();
+        println!("         spam_ids ({}): {:?}", ids.len(), ids);
+    }
+    if args.show_field_mismatches > 0 {
+        // Re-walk and report up to N tokens where in/out diverged. Sets
+        // (rather than vector equality) are reported because order is
+        // not part of the contract — but vector order should also match
+        // production in practice. The set diff is what tells us which
+        // rev_ids one side has that the other doesn't.
+        use std::collections::HashSet;
+        let mut shown = 0usize;
+        for rev_map in &rc.revisions {
+            for entry in rev_map.values() {
+                for (i, exp) in entry.tokens.iter().enumerate() {
+                    if shown >= args.show_field_mismatches {
+                        break;
+                    }
+                    let Some(got) = rust_words.get(i) else { continue };
+                    let in_ok = exp.inbound == got.inbound;
+                    let out_ok = exp.outbound == got.outbound;
+                    if in_ok && out_ok {
+                        continue;
+                    }
+                    let rust_in: HashSet<u64> = got.inbound.iter().copied().collect();
+                    let exp_in: HashSet<u64> = exp.inbound.iter().copied().collect();
+                    let rust_out: HashSet<u64> = got.outbound.iter().copied().collect();
+                    let exp_out: HashSet<u64> = exp.outbound.iter().copied().collect();
+                    println!(
+                        "         token #{i} {:?} (id={}, origin={}, last={})",
+                        got.value, got.token_id, got.origin_rev_id, got.last_rev_id,
+                    );
+                    if !in_ok {
+                        let only_rust: Vec<u64> = rust_in.difference(&exp_in).copied().collect();
+                        let only_exp: Vec<u64> = exp_in.difference(&rust_in).copied().collect();
+                        println!(
+                            "           inbound:  rust={} expected={}  rust-only={:?} expected-only={:?}",
+                            got.inbound.len(), exp.inbound.len(),
+                            sorted(only_rust), sorted(only_exp),
+                        );
+                    }
+                    if !out_ok {
+                        let only_rust: Vec<u64> = rust_out.difference(&exp_out).copied().collect();
+                        let only_exp: Vec<u64> = exp_out.difference(&rust_out).copied().collect();
+                        println!(
+                            "           outbound: rust={} expected={}  rust-only={:?} expected-only={:?}",
+                            got.outbound.len(), exp.outbound.len(),
+                            sorted(only_rust), sorted(only_exp),
+                        );
+                    }
+                    shown += 1;
+                }
+            }
+        }
+    }
 
     tally.merge(&total);
     Ok(())
+}
+
+fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
+    v.sort();
+    v
 }
 
 fn main() -> Result<()> {

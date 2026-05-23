@@ -37,6 +37,29 @@ This isn't a Myers-vs-Differ issue — Myers vs Differ would also disturb `o_rev
 
 **Recommendation:** **B then A.** Run on one more fixture to characterize the divergence shape before spending hours on a Python-vs-Rust trace.
 
+> **Resolved 2026-05-23:** Root cause was a **bug in `scripts/capture_history.py`**, not in the algorithm. The script used `"minor" in rev` to test for the minor-edit flag — correct for formatversion=1, where MW omits the key when not minor, but wrong for formatversion=2 (which we use) where `minor` is always present as a bool. Every captured revision was wrongly tagged `minor=true`, which trips the `comment AND minor` good-faith-move escape hatch in the length-shrink check (`wikiwho.py:161`). The escape hatch was hiding most blanking vandalism from our cascade. Fix: `"minor": bool(rev.get("minor", False))`. After re-capture, simple Wikipedia jumped from 90 → 230 spam catches and inbound/outbound parity from 1.94% → 53.70%. The remaining 47% looks like a mix of Myers-vs-Differ artifacts and (smaller) algorithm divergences worth a follow-up trace — see new entry below.
+
+---
+
+## 2026-05-23 — residual inbound/outbound divergence on simple Wikipedia (~47%) [non-blocking]
+
+**Context:** After fixing the capture-script formatversion=2 bug (see prior entry), simple Wikipedia full-history parity reaches `inbound 53.70% / outbound 53.64% / all-fields 53.37%` (was 1.94%). The remaining gap is no longer a 2× inflation — it's a scattered per-token divergence. `--show-field-mismatches 6` on simple/27263 shows:
+
+```
+token #0 "{{"   : rust=48 expected=49  expected-only=[6710716] / [6710715]
+token #1 "about": rust=50 expected=47  rust-only=[6536549, 7882429, 7882438] / [6536548, 7882426, 7882436]
+token #2 "|"    : rust=43 expected=46  expected-only=[7864020, 10612098, 10612125] / ...
+```
+
+All the rust-only and expected-only rev_ids are **vandalism-and-revert pairs**. Production records the events on SOME tokens but not others (e.g. token "{{" records 6710715/6710716, but token "about" doesn't); we do the opposite. So this is no longer a missed-spam-detection issue — it's a cascade-ordering / matching difference between Python's Differ and our Myers (or one of the matching sub-cases) that causes a token to be matched-vs-allocated-fresh differently for vandalism-burst revisions. This is the documented Myers-vs-Differ class of issue from `ALGORITHM.md §6`, just larger than expected.
+
+**Options:**
+- **A. Get more data first.** The current sample size is N=1 article (simple Wikipedia). 中国 + Israel-Hamas war replay at ~100% all-fields. Capture one more mid-size en fixture (Photosynthesis and Jesse_Owens both >5K — need `--max-revs 10000` or a smaller article like Gaza_war / a newer biographical) to see if 53% is the new floor or simple Wikipedia is uniquely bad.
+- **B. Trace a single mismatching rev pair.** Pick e.g. rev 6710715 / 6710716 on "{{" — run both Python (in a small standalone harness) and our cascade with verbose logging and see exactly where the token-id assignment diverges.
+- **C. Accept the floor and ship.** WhoColor consumers visualize inbound/outbound history; consumers care most about `o_rev_id` + `editor`. Document the divergence shape (Myers-vs-Differ cascading through vandalism revs), ship at 91% o_rev_id, revisit if a consumer complains.
+
+**Recommendation:** **A then B.** Bigger sample first; the 53% number is one fixture's signal.
+
 ---
 
 ## 2026-05-22 — handling historical-tokenization divergence [non-blocking]
