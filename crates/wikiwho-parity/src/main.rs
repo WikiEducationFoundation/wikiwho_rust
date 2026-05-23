@@ -3,14 +3,20 @@
 //! counts. The output of this binary is the ratchet the algorithm port
 //! climbs.
 //!
-//! Current comparison level: **tokenizer parity** — for each fixture
-//! we read the cached wikitext, lowercase it, walk it through
-//! `wikiwho_attribute::tokenize::tokenize_revision`, and compare the
-//! resulting token strings positionally to `rev_content.json`'s
-//! `tokens[i].str`. This validates the tokenizer + paragraph/sentence
-//! splitter against real Wikipedia text; it does NOT yet validate the
-//! attribution algorithm (which needs the matching cascade + Myers
-//! diff + multi-revision input).
+//! Current comparison level: **cascade single-rev parity** — for each
+//! fixture we read the cached wikitext, run it through
+//! `Article::analyse_revision` (full paragraph + sentence +
+//! insertion-only token cascade), and compare the resulting
+//! `article.tokens[i].value` to `rev_content.json`'s `tokens[i].str`.
+//! This exercises the splitter AND the cascade plumbing end-to-end
+//! on real Wikipedia text; the headline percentage matches the
+//! tokenizer-only number because both walk the same splitter — the
+//! cascade adds metadata (token_id, origin_rev_id, in, out) that
+//! single-rev fixtures cannot validate.
+//!
+//! To improve the metric meaningfully we need either (a) multi-rev
+//! fixtures (rev_1..rev_N feed) so the diff path matters, or (b) a
+//! Differ-equivalent Myers tie-breaker — see `notes/decisions-needed.md`.
 //!
 //! Usage:
 //!   parity-check                       # run against all fixtures
@@ -125,12 +131,13 @@ impl Tally {
         println!("  elapsed:            {} ms", elapsed_ms);
         println!();
         println!(
-            "  note: tokenizer-level parity only. The attribution \
-             algorithm (matching cascade, Myers diff, multi-rev history) \
-             isn't ported yet, so o_rev_id / token_id / in / out aren't \
-             validated. This number reflects whether the paragraph / \
-             sentence / token splitter agrees with the reference on real \
-             Wikipedia text."
+            "  note: cascade single-rev parity. The full paragraph + \
+             sentence + insertion-only token cascade runs end-to-end on \
+             each fixture, but `o_rev_id` / `token_id` / `in` / `out` \
+             aren't compared yet — single-rev fixtures can't validate \
+             them. Headline percentage matches tokenizer-only because \
+             the cascade walks the same splitter. Move to multi-rev \
+             fixtures to make this number meaningful."
         );
     }
 }
@@ -330,11 +337,36 @@ fn process_one(fixture: &Path, args: &Args, tally: &mut Tally) -> Result<()> {
         );
     }
 
-    // The reference algorithm lowercases at wikiwho.py:123 / :191 before
-    // tokenization. Mirror that here so the Rust output is comparable
-    // to the captured (already-lowercased) fixture tokens.
-    let lowered = wikitext.to_lowercase();
-    let rust_tokens = wikiwho_attribute::tokenize::tokenize_revision(&lowered);
+    // Run the wikitext through the full cascade. `analyse_revision`
+    // lowercases internally (wikiwho.py:123 / :191) before any
+    // tokenizer call, so we pass the raw wikitext. For tokenizer-only
+    // parity (the current ratchet) the cascade and the splitter
+    // produce identical output; the cascade also populates
+    // `article.tokens` with Word metadata that future parity levels
+    // will validate.
+    let mut article = wikiwho_attribute::structures::Article::new(&meta.title);
+    let outcome = article.analyse_revision(wikiwho_attribute::pipeline::RevisionInput {
+        rev_id: meta.rev_id,
+        timestamp: String::from("1970-01-01T00:00:00Z"),
+        text: wikitext,
+        sha1: None,
+        comment: None,
+        minor: false,
+        user_id: None,
+        user_name: None,
+    });
+    if let wikiwho_attribute::pipeline::RevisionOutcome::Vandalism(reason) = outcome {
+        bail!(
+            "{}/{} rev_id={} flagged as vandalism ({:?}); the parity \
+             corpus is curated production revisions, this is a cascade \
+             bug",
+            meta.lang,
+            meta.page_id,
+            meta.rev_id,
+            reason
+        );
+    }
+    let rust_tokens: Vec<String> = article.tokens.iter().map(|w| w.value.clone()).collect();
 
     let mut total = ComparisonResult::default();
     for rev_map in &rc.revisions {
