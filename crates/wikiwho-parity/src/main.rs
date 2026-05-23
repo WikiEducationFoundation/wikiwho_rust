@@ -64,7 +64,7 @@ struct RevisionEntry {
     tokens: Vec<TokenEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct TokenEntry {
     // `str` is the only field guaranteed by API.md to be present; the
     // rest depend on query params. We capture only what we'll diff
@@ -102,6 +102,17 @@ struct HistoryEntry {
     user_name: Option<String>,
     text: String,
     text_hidden: bool,
+}
+
+/// Output of `scripts/python_replay.py`. We only consume `final_tokens`;
+/// the rest is for human inspection. The `final_tokens` shape is
+/// compatible with `RevisionEntry.tokens` (rev_content.json's tokens
+/// array), so the same comparator works for both ground-truth sources.
+#[derive(Debug, Deserialize)]
+struct PythonReplay {
+    target_rev_id: u64,
+    #[serde(default)]
+    final_tokens: Option<Vec<TokenEntry>>,
 }
 
 #[derive(Debug, Default)]
@@ -208,10 +219,12 @@ impl Tally {
                 "  note: full-history parity. Each fixture's history.jsonl \
                  is replayed in order through Article::analyse_revision; \
                  the final-revision token stream is then compared to the \
-                 production wikiwho-api output. The all-fields percentage \
-                 is the real algorithm-parity number — anything below \
-                 100% is either a divergence we accept (Myers vs Differ \
-                 tie-breaking on duplicates) or a bug to investigate."
+                 reference (production wikiwho-api by default, or a fresh \
+                 Python run with --python-replay). The all-fields \
+                 percentage is the real algorithm-parity number — \
+                 anything below 100% is either a Rust-Myers-vs-Python-\
+                 Differ divergence (intrinsic until we port Differ) or a \
+                 bug to investigate."
             );
         } else {
             println!(
@@ -401,6 +414,22 @@ struct Args {
     /// stops being "everything is wrong." Only meaningful with
     /// `--full-history`.
     rev_id_histogram: usize,
+    /// Cap full-history replay at this many revisions. Useful for
+    /// binary-searching when divergences first appear, and for fast
+    /// iteration on small slices.
+    max_revs: Option<usize>,
+    /// In full-history mode, compare against a fresh run of the
+    /// reference Python wikiwho.py instead of the captured
+    /// rev_content.json. Sage's directive: the production cache may
+    /// have evolved over years, but a fresh-from-scratch Python run
+    /// on the same history.jsonl is the real reference. The Python
+    /// output is cached at <fixture>/python_replay.json so subsequent
+    /// runs are fast.
+    python_replay: bool,
+    /// Force a re-run of the Python reference even if a cached
+    /// python_replay.json exists. Used after fixture or capture-script
+    /// changes.
+    refresh_python: bool,
 }
 
 fn parse_args() -> Args {
@@ -413,6 +442,9 @@ fn parse_args() -> Args {
         show_field_mismatches: 0,
         show_spam_ids: false,
         rev_id_histogram: 0,
+        max_revs: None,
+        python_replay: false,
+        refresh_python: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -437,13 +469,26 @@ fn parse_args() -> Args {
                     .and_then(|s| s.parse().ok())
                     .expect("--rev-id-histogram requires a positive integer");
             }
+            "--max-revs" => {
+                out.max_revs = Some(
+                    args.next()
+                        .and_then(|s| s.parse().ok())
+                        .expect("--max-revs requires a positive integer"),
+                );
+            }
+            "--python-replay" => out.python_replay = true,
+            "--refresh-python" => {
+                out.python_replay = true;
+                out.refresh_python = true;
+            }
             "-h" | "--help" => {
                 eprintln!("{}", env!("CARGO_PKG_DESCRIPTION"));
                 eprintln!();
                 eprintln!(
                     "Usage: parity-check [--fixtures DIR] [--show-first-diff] \
                      [--full-history] [--show-field-mismatches N] \
-                     [--show-spam-ids] [--rev-id-histogram N] \
+                     [--show-spam-ids] [--rev-id-histogram N] [--max-revs N] \
+                     [--python-replay] [--refresh-python] \
                      [LANG/PAGE_ID ...]"
                 );
                 std::process::exit(0);
@@ -504,6 +549,45 @@ fn load_meta(path: &Path) -> Result<Meta> {
         .with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Load a fixture's Python-reference token sequence, regenerating it
+/// via `scripts/python_replay.py` if absent or `--refresh-python` was
+/// set. The cache lives at `<fixture>/python_replay.json` and is
+/// regeneratable from `history.jsonl` alone (no MW or production API
+/// dependency).
+fn load_python_replay(fixture: &Path, refresh: bool) -> Result<PythonReplay> {
+    let cache = fixture.join("python_replay.json");
+    if !cache.exists() || refresh {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts")
+            .join("python_replay.py");
+        eprintln!(
+            "  [python] regenerating {} via {}",
+            cache.display(),
+            script.display()
+        );
+        let output = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(fixture)
+            .output()
+            .with_context(|| format!("invoking python3 {}", script.display()))?;
+        if !output.status.success() {
+            bail!(
+                "python_replay.py failed (status {}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        fs::write(&cache, &output.stdout)
+            .with_context(|| format!("writing {}", cache.display()))?;
+    }
+    let bytes = fs::read(&cache)
+        .with_context(|| format!("reading {}", cache.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", cache.display()))
 }
 
 fn process_one(fixture: &Path, args: &Args, tally: &mut Tally) -> Result<()> {
@@ -671,7 +755,7 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
 
     let history_text = fs::read_to_string(&history_path)
         .with_context(|| format!("reading {}", history_path.display()))?;
-    let entries: Vec<HistoryEntry> = history_text
+    let mut entries: Vec<HistoryEntry> = history_text
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| {
@@ -679,6 +763,9 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
                 .with_context(|| format!("parsing line of {}", history_path.display()))
         })
         .collect::<Result<_>>()?;
+    if let Some(cap) = args.max_revs {
+        entries.truncate(cap);
+    }
 
     let mut article = wikiwho_attribute::structures::Article::new(&meta.title);
     article.page_id = Some(meta.page_id);
@@ -712,9 +799,41 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
         }
     }
 
-    // Pull the final revision and compare its token stream.
-    let Some(final_rev) = article.revisions.get(&meta.rev_id) else {
-        bail!(
+    // Pull the final revision and compare its token stream. When
+    // `--max-revs` truncated the input, the target rev_id may not be
+    // present — in that case we still print the structural state so
+    // the user can see how it evolved over the slice, but skip the
+    // production-comparison block.
+    let final_rev = match article.revisions.get(&meta.rev_id) {
+        Some(r) => r,
+        None if args.max_revs.is_some() => {
+            println!(
+                "  [SKIP-CMP] {}/{} {} — target rev_id={} not in replay \
+                 (--max-revs cap), reporting state only",
+                meta.lang, meta.page_id, rc.article_title, meta.rev_id,
+            );
+            println!(
+                "         replayed {} of {} (capped) revs, hidden {}, spam {}",
+                fed, entries.len(), skipped_hidden, spam_count,
+            );
+            if args.show_spam_ids {
+                let mut ids = article.spam_ids.clone();
+                ids.sort();
+                println!("         spam_ids ({}): {:?}", ids.len(), ids);
+                println!(
+                    "         arena: tokens={} sentences={} paragraphs={} | ht: \
+                     paragraphs_ht={} sentences_ht={} | processed_revs={}",
+                    article.tokens.len(),
+                    article.sentences.len(),
+                    article.paragraphs.len(),
+                    article.paragraphs_ht.len(),
+                    article.sentences_ht.len(),
+                    article.revisions.len(),
+                );
+            }
+            return Ok(());
+        }
+        None => bail!(
             "{}/{} target rev_id={} not in article.revisions after replay \
              (fed {} of {} input revs, hidden {}, spam {}). Either the \
              history doesn't actually reach the target, or our algorithm \
@@ -726,7 +845,7 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
             entries.len(),
             skipped_hidden,
             spam_count,
-        );
+        ),
     };
     let final_token_ids = wikiwho_attribute::structures::iter_rev_tokens(&article, final_rev);
     let rust_words: Vec<&wikiwho_attribute::structures::Word> = final_token_ids
@@ -734,26 +853,46 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
         .map(|id| article.word(*id))
         .collect();
 
-    let mut total = ComparisonResult::default();
-    for rev_map in &rc.revisions {
-        for entry in rev_map.values() {
-            let c = compare_full(&rust_words, &entry.tokens);
-            total.rev_count += c.rev_count;
-            total.rev_passing += c.rev_passing;
-            total.token_count += c.token_count;
-            total.token_passing += c.token_passing;
-            total.o_rev_id_passing += c.o_rev_id_passing;
-            total.inbound_passing += c.inbound_passing;
-            total.outbound_passing += c.outbound_passing;
-            total.all_fields_passing += c.all_fields_passing;
-            if total.first_diff.is_none() {
-                total.first_diff = c.first_diff;
-            }
-            if total.length_mismatch.is_none() {
-                total.length_mismatch = c.length_mismatch;
-            }
+    // Resolve the expected-tokens source. With --python-replay, we use a
+    // fresh Python run (cached at <fixture>/python_replay.json); without
+    // it, we use the captured production rev_content.json. Per Sage:
+    // production caches may have evolved over years, so the Python run
+    // is the real reference for algorithm parity.
+    let expected_tokens: Vec<TokenEntry> = if args.python_replay {
+        let pr = load_python_replay(fixture, args.refresh_python)?;
+        if pr.target_rev_id != meta.rev_id {
+            bail!(
+                "{}: python_replay.json target_rev_id={} disagrees with meta rev_id={}",
+                fixture.display(),
+                pr.target_rev_id,
+                meta.rev_id,
+            );
         }
-    }
+        pr.final_tokens.ok_or_else(|| anyhow::anyhow!(
+            "{}: python_replay.json has final_tokens=null — Python flagged \
+             the target revision as spam? Re-run with --refresh-python after \
+             fixing the input.",
+            fixture.display(),
+        ))?
+    } else {
+        rc.revisions
+            .iter()
+            .flat_map(|m| m.values().flat_map(|e| e.tokens.iter().cloned()))
+            .collect()
+    };
+
+    let mut total = ComparisonResult::default();
+    let c = compare_full(&rust_words, &expected_tokens);
+    total.rev_count += c.rev_count;
+    total.rev_passing += c.rev_passing;
+    total.token_count += c.token_count;
+    total.token_passing += c.token_passing;
+    total.o_rev_id_passing += c.o_rev_id_passing;
+    total.inbound_passing += c.inbound_passing;
+    total.outbound_passing += c.outbound_passing;
+    total.all_fields_passing += c.all_fields_passing;
+    total.first_diff = c.first_diff;
+    total.length_mismatch = c.length_mismatch;
 
     let pass_pct_all = if total.token_count == 0 {
         0.0
@@ -770,8 +909,9 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
     } else {
         "FAIL"
     };
+    let source_tag = if args.python_replay { "vs python" } else { "vs prod-cache" };
     println!(
-        "  [{}] {}/{} {} (rev_id={}) — replayed {} of {} revs ({} hidden, \
+        "  [{}] {}/{} {} (rev_id={}, {source_tag}) — replayed {} of {} revs ({} hidden, \
          {} spam) — str {} / {} ({:.2}%), all-fields {} / {} ({:.2}%)",
         pass_marker,
         meta.lang,
@@ -806,6 +946,20 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
         let mut ids = article.spam_ids.clone();
         ids.sort();
         println!("         spam_ids ({}): {:?}", ids.len(), ids);
+        let p_ht_total: usize = article.paragraphs_ht.values().map(Vec::len).sum();
+        let s_ht_total: usize = article.sentences_ht.values().map(Vec::len).sum();
+        println!(
+            "         arena: tokens={} sentences={} paragraphs={} | ht hashes: \
+             paragraphs_ht={} sentences_ht={} | ht totals: p={} s={} | processed_revs={}",
+            article.tokens.len(),
+            article.sentences.len(),
+            article.paragraphs.len(),
+            article.paragraphs_ht.len(),
+            article.sentences_ht.len(),
+            p_ht_total,
+            s_ht_total,
+            article.revisions.len(),
+        );
     }
     if args.rev_id_histogram > 0 {
         // For each rev_id mentioned anywhere in inbound or outbound,
@@ -826,16 +980,12 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
                 *rust_out.entry(r).or_default() += 1;
             }
         }
-        for rev_map in &rc.revisions {
-            for entry in rev_map.values() {
-                for tok in &entry.tokens {
-                    for &r in &tok.inbound {
-                        *exp_in.entry(r).or_default() += 1;
-                    }
-                    for &r in &tok.outbound {
-                        *exp_out.entry(r).or_default() += 1;
-                    }
-                }
+        for tok in &expected_tokens {
+            for &r in &tok.inbound {
+                *exp_in.entry(r).or_default() += 1;
+            }
+            for &r in &tok.outbound {
+                *exp_out.entry(r).or_default() += 1;
             }
         }
         let mut all_revs: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
@@ -877,51 +1027,47 @@ fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> R
         // Re-walk and report up to N tokens where in/out diverged. Sets
         // (rather than vector equality) are reported because order is
         // not part of the contract — but vector order should also match
-        // production in practice. The set diff is what tells us which
+        // expected in practice. The set diff is what tells us which
         // rev_ids one side has that the other doesn't.
         use std::collections::HashSet;
         let mut shown = 0usize;
-        for rev_map in &rc.revisions {
-            for entry in rev_map.values() {
-                for (i, exp) in entry.tokens.iter().enumerate() {
-                    if shown >= args.show_field_mismatches {
-                        break;
-                    }
-                    let Some(got) = rust_words.get(i) else { continue };
-                    let in_ok = exp.inbound == got.inbound;
-                    let out_ok = exp.outbound == got.outbound;
-                    if in_ok && out_ok {
-                        continue;
-                    }
-                    let rust_in: HashSet<u64> = got.inbound.iter().copied().collect();
-                    let exp_in: HashSet<u64> = exp.inbound.iter().copied().collect();
-                    let rust_out: HashSet<u64> = got.outbound.iter().copied().collect();
-                    let exp_out: HashSet<u64> = exp.outbound.iter().copied().collect();
-                    println!(
-                        "         token #{i} {:?} (id={}, origin={}, last={})",
-                        got.value, got.token_id, got.origin_rev_id, got.last_rev_id,
-                    );
-                    if !in_ok {
-                        let only_rust: Vec<u64> = rust_in.difference(&exp_in).copied().collect();
-                        let only_exp: Vec<u64> = exp_in.difference(&rust_in).copied().collect();
-                        println!(
-                            "           inbound:  rust={} expected={}  rust-only={:?} expected-only={:?}",
-                            got.inbound.len(), exp.inbound.len(),
-                            sorted(only_rust), sorted(only_exp),
-                        );
-                    }
-                    if !out_ok {
-                        let only_rust: Vec<u64> = rust_out.difference(&exp_out).copied().collect();
-                        let only_exp: Vec<u64> = exp_out.difference(&rust_out).copied().collect();
-                        println!(
-                            "           outbound: rust={} expected={}  rust-only={:?} expected-only={:?}",
-                            got.outbound.len(), exp.outbound.len(),
-                            sorted(only_rust), sorted(only_exp),
-                        );
-                    }
-                    shown += 1;
-                }
+        for (i, exp) in expected_tokens.iter().enumerate() {
+            if shown >= args.show_field_mismatches {
+                break;
             }
+            let Some(got) = rust_words.get(i) else { continue };
+            let in_ok = exp.inbound == got.inbound;
+            let out_ok = exp.outbound == got.outbound;
+            if in_ok && out_ok {
+                continue;
+            }
+            let rust_in: HashSet<u64> = got.inbound.iter().copied().collect();
+            let exp_in: HashSet<u64> = exp.inbound.iter().copied().collect();
+            let rust_out: HashSet<u64> = got.outbound.iter().copied().collect();
+            let exp_out: HashSet<u64> = exp.outbound.iter().copied().collect();
+            println!(
+                "         token #{i} {:?} (id={}, origin={}, last={})",
+                got.value, got.token_id, got.origin_rev_id, got.last_rev_id,
+            );
+            if !in_ok {
+                let only_rust: Vec<u64> = rust_in.difference(&exp_in).copied().collect();
+                let only_exp: Vec<u64> = exp_in.difference(&rust_in).copied().collect();
+                println!(
+                    "           inbound:  rust={} expected={}  rust-only={:?} expected-only={:?}",
+                    got.inbound.len(), exp.inbound.len(),
+                    sorted(only_rust), sorted(only_exp),
+                );
+            }
+            if !out_ok {
+                let only_rust: Vec<u64> = rust_out.difference(&exp_out).copied().collect();
+                let only_exp: Vec<u64> = exp_out.difference(&rust_out).copied().collect();
+                println!(
+                    "           outbound: rust={} expected={}  rust-only={:?} expected-only={:?}",
+                    got.outbound.len(), exp.outbound.len(),
+                    sorted(only_rust), sorted(only_exp),
+                );
+            }
+            shown += 1;
         }
     }
 

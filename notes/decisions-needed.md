@@ -60,6 +60,37 @@ All the rust-only and expected-only rev_ids are **vandalism-and-revert pairs**. 
 
 **Recommendation:** **A then B.** Bigger sample first; the 53% number is one fixture's signal.
 
+> **Resolved 2026-05-23:** All three sub-questions answered.
+>
+> **A.** Photosynthesis (5495 revs) lands at **80.28% all-fields** vs prod-cache *and* **80.28% vs fresh Python** (identical). Simple Wikipedia is the outlier — high-vandalism wiki with structural restructuring. The 80% number is the more representative floor.
+>
+> **(Bonus — per Sage's redirect:)** The historical-evolution concern in the original framing turned out to be a non-issue for these fixtures. New `--python-replay` mode runs `scripts/python_replay.py` against the same `history.jsonl` and uses that as ground truth instead of the captured `rev_content.json`. Result: Photosynthesis went from 80.28% (vs prod-cache) to 80.28% (vs Python) — *identical*; simple Wikipedia 52.99% → 53.41% — tiny bump. So the production caches for these specific fixtures match what fresh Python would produce; the residual gap is not a historical-cache artifact.
+>
+> **B + structural finding.** A direct structural comparison (`scripts/python_replay.py` + new `--show-spam-ids` arena/ht counters in `parity-check`) shows:
+> - `spam_ids` count and contents: **PERFECT** match (230 = 230 on simple, both lists byte-identical).
+> - `paragraphs_ht` hashes & totals: PERFECT (2888 hashes, 2915 total on simple) or essentially-perfect (+3 on Photosynthesis).
+> - `sentences_ht` hashes: PERFECT; totals +16 on simple, +31 on Photosynthesis (0.2-0.3%).
+> - **Token allocations: -3.3% on simple (100,363 vs 103,742), -4.4% on Photosynthesis (114,223 vs 119,470).**
+>
+> The structural state (which paragraphs and sentences ever appeared) agrees byte-for-byte; the divergence is concentrated in **token-level matching**. We allocate *fewer* tokens than Python, meaning our Myers diff finds longer Keep sequences than Python's Differ (which uses Ratcliff/Obershelp pattern matching, not true LCS). The few-percent token-id divergence cascades into ~20-50% inbound/outbound divergence on the final-rev token stream.
+>
+> **C resolution.** The 80% floor is now the documented intrinsic Myers-vs-Differ divergence per `ALGORITHM.md §6`. The path to 100% is to port Differ exactly. That's a follow-up decision — not blocking ship. Filing a new entry below.
+
+---
+
+## 2026-05-23 — close Myers-vs-Differ gap by porting Differ? [non-blocking]
+
+**Context:** With Python ground truth via `--python-replay`, the remaining all-fields divergence is now characterized as **token-level Myers-vs-Differ**. Structural state (paragraphs_ht, sentences_ht, spam_ids) matches Python byte-for-byte. Token allocations diverge by 3-4% (we allocate fewer, because Myers finds longer LCS than Python's `difflib.Differ` which uses Ratcliff/Obershelp pattern matching — *not* true LCS). The few-percent token-count delta cascades into 20-50% per-token inbound/outbound divergence on the final-rev wire format.
+
+`ALGORITHM.md §6` documented the bail-out condition ">0.1% token divergence OR any divergence on known-hard articles." We're at 3-4%, well above 0.1%. The decision to ship Myers was made before we had Python-replay data to measure against; now that we do, we have a choice.
+
+**Options:**
+- **A. Port Differ.** Write a Rust implementation of Python's `difflib.SequenceMatcher.get_opcodes()` (the Ratcliff/Obershelp matcher) and use it inside the cascade. Expected outcome: ~100% all-fields parity. Cost: a non-trivial diff algorithm port (Ratcliff/Obershelp is ~150 lines of Python; not optimal LCS, has its own quirks). Maintenance cost: now we own a Python-stdlib re-implementation forever.
+- **B. Accept the gap and ship.** Document the divergence shape. Downstream consumers (`../WikiEduDashboardTwo/`, `../impact-visualizer/`, XTools, WhoWroteThat) mostly care about `o_rev_id` + `editor`. The Photosynthesis test shows o_rev_id at **86.19%** (vs Python). That's the metric the consumers will feel. Decide whether 86% is shippable.
+- **C. Add an alternate diff path.** Keep Myers as the default; add a `--differ` flag (or similar) that switches to a Differ port for parity-critical paths. Only worth it if option A's correctness payoff is high enough but the runtime cost matters.
+
+**Recommendation:** Investigate **how much o_rev_id parity downstream consumers actually need before deciding** — Sage's three consumer projects are the ground truth here. If Dashboard's ArticleViewer can tolerate 14% of tokens having a wrong attribution-revision, ship with Myers. If not, port Differ.
+
 ---
 
 ## 2026-05-22 — handling historical-tokenization divergence [non-blocking]
