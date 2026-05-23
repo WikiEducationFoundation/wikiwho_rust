@@ -170,6 +170,41 @@ pub fn split_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Tokenize an entire revision in the order the algorithm produces.
+///
+/// The algorithm doesn't tokenize a revision in one pass; it splits
+/// into paragraphs, then each paragraph into sentences, then each
+/// sentence into tokens. Paragraphs whose `strip()` is empty are
+/// skipped (`wikiwho.py:340`); sentences whose `strip()` is empty are
+/// skipped (`wikiwho.py:476`); each surviving sentence is tokenized,
+/// and the token list is flattened in document order. That order is
+/// what the response builder emits in the JSON `tokens` array.
+///
+/// **Caller responsibility:** `text` must already be lowercased. The
+/// reference algorithm lowercases at the boundary (`wikiwho.py:123`,
+/// `wikiwho.py:191`) before invoking any splitter.
+pub fn tokenize_revision(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for paragraph in split_paragraphs(text) {
+        if paragraph.trim().is_empty() {
+            continue;
+        }
+        for sentence in split_sentences(&paragraph) {
+            let trimmed = sentence.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Sentence is stored in the algorithm as the space-joined
+            // token list (wikiwho.py:479) and later split back on
+            // space to repopulate `words` (wikiwho.py:599). Since no
+            // token returned by split_tokens contains a space, that
+            // round-trip is the identity — yield tokens directly.
+            out.extend(split_tokens(trimmed));
+        }
+    }
+    out
+}
+
 /// Compute the average count-per-distinct-token across the input,
 /// ignoring a small set of structural tokens. Used by the vandalism
 /// heuristic in `wikiwho.py:608-613` (`compute_avg_word_freq` in
@@ -381,6 +416,59 @@ mod tests {
         let b = split_tokens("foo bar").join(" ");
         assert_eq!(a, b);
         assert_eq!(a, "foo bar");
+    }
+
+    #[test]
+    fn tokenize_revision_simple() {
+        // Single paragraph, single sentence
+        assert_eq!(
+            tokenize_revision("hello world"),
+            vec!["hello", "world"]
+        );
+    }
+
+    #[test]
+    fn tokenize_revision_skips_empty_paragraphs() {
+        // Two empty paragraphs sandwiched between non-empty ones.
+        // Empty here means "blank-line-only" — between four \n, the
+        // middle paragraph after split_paragraphs is "" which the
+        // filter drops.
+        let text = "first\n\n\n\nsecond";
+        let result = tokenize_revision(text);
+        assert_eq!(result, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn tokenize_revision_multi_sentence_paragraph() {
+        let text = "foo bar. baz qux.";
+        // split_sentences yields ["foo bar.", "baz qux."]; each
+        // tokenizes individually
+        assert_eq!(
+            tokenize_revision(text),
+            vec!["foo", "bar", ".", "baz", "qux", "."]
+        );
+    }
+
+    #[test]
+    fn tokenize_revision_wiki_markup() {
+        // [[link]] should yield [[, link, ]]; punctuation isolated.
+        assert_eq!(
+            tokenize_revision("see [[link]]."),
+            vec!["see", "[[", "link", "]]", "."]
+        );
+    }
+
+    #[test]
+    fn tokenize_revision_table_paragraph_splitting() {
+        // Wikitext table becomes its own paragraph; the surrounding
+        // text becomes separate paragraphs.
+        let text = "before{|x|}after";
+        // split_paragraphs splits this into ["before", "{|x|}", "after"]
+        let result = tokenize_revision(text);
+        // "before" -> ["before"]; "{|x|}" -> ["{", "|", "x", "|", "}"]
+        // — wait, "{|" reconstructs? Let me think... no, "{|" gets `{|` not `{{` so
+        // it splits as "{", "|", "x", "|", "}". Same for "}".
+        assert_eq!(result, vec!["before", "{", "|", "x", "|", "}", "after"]);
     }
 
     #[test]

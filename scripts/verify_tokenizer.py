@@ -23,6 +23,24 @@ from WikiWho.utils import (  # noqa: E402
     split_into_tokens,
 )
 
+
+def tokenize_revision(text):
+    """Walk paragraphs -> sentences -> tokens with the algorithm's filtering.
+
+    Mirrors the order in which tokens are added to revision_curr in
+    wikiwho.py:340-687, ignoring matching against prior revisions.
+    """
+    out = []
+    for paragraph in split_into_paragraphs(text):
+        if paragraph.strip() == "":
+            continue
+        for sentence in split_into_sentences(paragraph):
+            sentence = sentence.strip()
+            if sentence == "":
+                continue
+            out.extend(split_into_tokens(sentence))
+    return out
+
 # Inputs the Rust tests assert against. Keep in sync with the
 # `#[test]` cases in crates/wikiwho-attribute/src/tokenize.rs.
 PROBES = [
@@ -65,6 +83,12 @@ PROBES = [
     ("split_tokens", ""),
     ("split_tokens", "foo  bar"),
     ("split_tokens", "foo bar"),
+    # tokenize_revision (algorithm's per-revision iteration)
+    ("tokenize_revision", "hello world"),
+    ("tokenize_revision", "first\n\n\n\nsecond"),
+    ("tokenize_revision", "foo bar. baz qux."),
+    ("tokenize_revision", "see [[link]]."),
+    ("tokenize_revision", "before{|x|}after"),
 ]
 
 
@@ -77,6 +101,8 @@ def run(name, text):
         return split_into_sentences(text)
     if name == "split_tokens":
         return list(split_into_tokens(text))
+    if name == "tokenize_revision":
+        return tokenize_revision(text)
     raise ValueError(name)
 
 
