@@ -19,15 +19,18 @@
 //! provides a CLI replacement for `scripts/capture_history.py` that
 //! emits the same JSONL shape (one revision per line).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use reqwest::Client;
 
 pub mod info;
 pub mod revisions;
+pub mod users;
 
 pub use info::{PageInfo, parse_page_info};
 pub use revisions::{Batch, Revision, RevisionFetcher};
+pub use users::parse_users_response;
 
 /// Default User-Agent string. Wikimedia policy requires a contact
 /// address; tweak via [`MwClient::builder`] if shipping under a
@@ -37,6 +40,11 @@ pub const DEFAULT_USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (https://github.com/WikiEducationFoundation; sage@wikiedu.org)"
 );
+
+/// Max user_ids per `list=users&ususerids=` request. MW caps anonymous
+/// callers at 50; bot accounts can do 500 with `apihighlimits`. The
+/// Python reference at `WhoColor/utils.py:103` also uses 50.
+pub const MW_USERS_BATCH_SIZE: usize = 50;
 
 /// Errors surfaced by the MW client. `Api` is a structured MW error
 /// (the `{"error": {"code", "info"}}` envelope); `RateLimitBudgetExhausted`
@@ -81,6 +89,12 @@ pub type Result<T> = std::result::Result<T, MwError>;
 #[derive(Debug, Clone)]
 pub struct MwClient {
     api_url: String,
+    /// Base URL of the wiki's REST API (e.g.
+    /// `https://en.wikipedia.org/api/rest_v1`). Used by
+    /// `fetch_parsoid_html` for the `/page/html/{title}/{rev_id}`
+    /// endpoint. Derived from the Action API URL by default; tests
+    /// can override via [`MwClientBuilder::rest_base_url`].
+    rest_base_url: String,
     http: Client,
     user_agent: String,
     between_batches: Duration,
@@ -102,6 +116,10 @@ impl MwClient {
 
     pub fn api_url(&self) -> &str {
         &self.api_url
+    }
+
+    pub fn rest_base_url(&self) -> &str {
+        &self.rest_base_url
     }
 
     pub fn user_agent(&self) -> &str {
@@ -179,6 +197,129 @@ impl MwClient {
             ])
             .await?;
         parse_page_info(&body)
+    }
+
+    /// Resolve a batch of `user_id`s to `(user_id, user_name)` pairs.
+    ///
+    /// Used by the WhoColor endpoint to map editor IDs to display
+    /// names — see API.md §7. Anonymous editors (those whose `editor`
+    /// string starts with `0|`) are excluded by the caller; this
+    /// method only handles registered users.
+    ///
+    /// MW's `list=users&ususerids=` accepts up to 50 IDs per request
+    /// for anonymous callers (500 with `apihighlimits`). We batch in
+    /// groups of `MW_USERS_BATCH_SIZE` and concatenate. Unknown IDs
+    /// are silently omitted from the result map.
+    pub async fn resolve_users(&self, user_ids: &[u64]) -> Result<HashMap<u64, String>> {
+        let mut names: HashMap<u64, String> = HashMap::with_capacity(user_ids.len());
+        if user_ids.is_empty() {
+            return Ok(names);
+        }
+        // Dedupe + stable order so the test surface is deterministic.
+        let mut unique: Vec<u64> = user_ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+
+        for chunk in unique.chunks(MW_USERS_BATCH_SIZE) {
+            let ids_param = chunk
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join("|");
+            let body = self
+                .request_json(&[
+                    ("action", "query"),
+                    ("format", "json"),
+                    ("formatversion", "2"),
+                    ("list", "users"),
+                    ("ususerids", ids_param.as_str()),
+                ])
+                .await?;
+            for (id, name) in parse_users_response(&body)? {
+                names.insert(id, name);
+            }
+        }
+        Ok(names)
+    }
+
+    /// Fetch Parsoid HTML for a specific `(title, rev_id)` from the
+    /// wiki's REST API (`/api/rest_v1/page/html/{title}/{rev_id}`).
+    /// Used by the WhoColor endpoint as the substrate the
+    /// token-spans get injected into.
+    ///
+    /// PLAN.md §4.6 settled on this endpoint as the HTML source. WMF
+    /// caches it aggressively at the edge; the response body is
+    /// generally immutable per `(lang, rev_id)`.
+    pub async fn fetch_parsoid_html(&self, title: &str, rev_id: u64) -> Result<String> {
+        let url = format!(
+            "{base}/page/html/{title}/{rev_id}",
+            base = self.rest_base_url.trim_end_matches('/'),
+            title = urlencoding::encode(title),
+        );
+        self.request_text(&url).await
+    }
+
+    /// Low-level GET that returns the response body as a string.
+    /// Shared retry/backoff policy with [`Self::request_json`] but
+    /// doesn't try to JSON-decode the body. Used for Parsoid HTML.
+    async fn request_text(&self, url: &str) -> Result<String> {
+        let mut attempt = 0u32;
+        let mut slept: Duration = Duration::ZERO;
+
+        loop {
+            attempt += 1;
+            let response = self
+                .http
+                .get(url)
+                .header("User-Agent", &self.user_agent)
+                .send()
+                .await;
+            let response = match response {
+                Ok(r) => r,
+                Err(e) if attempt < self.retry_max_attempts && transient(&e) => {
+                    tokio::time::sleep(self.backoff_for(attempt)).await;
+                    continue;
+                }
+                Err(e) => return Err(MwError::Http(e)),
+            };
+            let status = response.status();
+            if status.as_u16() == 429 {
+                let ra = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| self.backoff_for(attempt));
+                let remaining = self.retry_budget.saturating_sub(slept);
+                if remaining.is_zero() {
+                    return Err(MwError::RateLimitBudgetExhausted {
+                        slept_seconds: slept.as_secs(),
+                        last_retry_after_seconds: ra.as_secs(),
+                    });
+                }
+                let sleep_for = ra.min(remaining);
+                slept += sleep_for;
+                tokio::time::sleep(sleep_for).await;
+                continue;
+            }
+            if status.as_u16() == 404 {
+                return Err(MwError::PageMissing { page_id: 0 });
+            }
+            if status.is_server_error() && attempt < self.retry_max_attempts {
+                tokio::time::sleep(self.backoff_for(attempt)).await;
+                continue;
+            }
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(MwError::Shape(format!(
+                    "HTTP {}: {}",
+                    status,
+                    truncate(&body, 300)
+                )));
+            }
+            return response.text().await.map_err(MwError::Http);
+        }
     }
 
     /// Resume an in-progress fetch from a saved `rvcontinue` token.
@@ -317,6 +458,7 @@ fn truncate(s: &str, n: usize) -> String {
 #[derive(Debug, Clone)]
 pub struct MwClientBuilder {
     api_url: String,
+    rest_base_url: String,
     user_agent: String,
     between_batches: Duration,
     retry_budget: Duration,
@@ -330,6 +472,7 @@ impl MwClientBuilder {
     pub fn for_lang(lang: &str) -> Self {
         Self {
             api_url: format!("https://{lang}.wikipedia.org/w/api.php"),
+            rest_base_url: format!("https://{lang}.wikipedia.org/api/rest_v1"),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             between_batches: Duration::from_millis(300),
             retry_budget: Duration::from_secs(300),
@@ -339,10 +482,14 @@ impl MwClientBuilder {
         }
     }
 
-    /// Start from a full API URL (e.g. a mock server in tests).
+    /// Start from a full API URL (e.g. a mock server in tests). The
+    /// REST base URL is left empty; set it explicitly via
+    /// [`Self::rest_base_url`] if the test needs to exercise Parsoid
+    /// HTML fetches.
     pub fn for_api_url(url: impl Into<String>) -> Self {
         Self {
             api_url: url.into(),
+            rest_base_url: String::new(),
             user_agent: DEFAULT_USER_AGENT.to_string(),
             between_batches: Duration::from_millis(300),
             retry_budget: Duration::from_secs(300),
@@ -350,6 +497,13 @@ impl MwClientBuilder {
             base_backoff: Duration::from_secs(1),
             request_timeout: Duration::from_secs(180),
         }
+    }
+
+    /// Override the REST API base URL. Tests use this to point Parsoid
+    /// HTML fetches at a mock server.
+    pub fn rest_base_url(mut self, url: impl Into<String>) -> Self {
+        self.rest_base_url = url.into();
+        self
     }
 
     pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
@@ -389,6 +543,7 @@ impl MwClientBuilder {
             .build()?;
         Ok(MwClient {
             api_url: self.api_url,
+            rest_base_url: self.rest_base_url,
             http,
             user_agent: self.user_agent,
             between_batches: self.between_batches,
