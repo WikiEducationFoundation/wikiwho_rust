@@ -273,6 +273,60 @@ impl Article {
     }
 }
 
+/// Walk a stored revision's paragraphs → sentences → words in document
+/// order and return the resulting list of `TokenId`s. Port of
+/// `iter_rev_tokens` in `../wikiwho_api/lib/WikiWho/WikiWho/utils.py:121`.
+///
+/// The tricky bit is duplicate hashes: when a paragraph hash appears
+/// N>1 times in `ordered_paragraphs`, the N entries in the bucket
+/// `revision.paragraphs[hash]` correspond 1:1 with the occurrences in
+/// document order. The reference uses a per-iteration counter; we use a
+/// `HashMap<&Hash, usize>` of seen counts (cleaner, identical
+/// semantics). Same trick applied at the sentence level (with the
+/// sentence counter reset per paragraph).
+pub fn iter_rev_tokens(article: &Article, revision: &Revision) -> Vec<TokenId> {
+    use std::collections::HashMap;
+
+    let mut tokens = Vec::new();
+    let mut p_seen: HashMap<&Hash, usize> = HashMap::new();
+    for hash_p in &revision.ordered_paragraphs {
+        let bucket = match revision.paragraphs.get(hash_p) {
+            Some(b) if !b.is_empty() => b,
+            _ => continue,
+        };
+        let p_idx = if bucket.len() > 1 {
+            let entry = p_seen.entry(hash_p).or_insert(0);
+            let i = *entry;
+            *entry += 1;
+            i.min(bucket.len() - 1)
+        } else {
+            0
+        };
+        let pid = bucket[p_idx];
+        let paragraph = article.paragraph(pid);
+
+        let mut s_seen: HashMap<&Hash, usize> = HashMap::new();
+        for hash_s in &paragraph.ordered_sentences {
+            let sbucket = match paragraph.sentences.get(hash_s) {
+                Some(b) if !b.is_empty() => b,
+                _ => continue,
+            };
+            let s_idx = if sbucket.len() > 1 {
+                let entry = s_seen.entry(hash_s).or_insert(0);
+                let i = *entry;
+                *entry += 1;
+                i.min(sbucket.len() - 1)
+            } else {
+                0
+            };
+            let sid = sbucket[s_idx];
+            let sentence = article.sentence(sid);
+            tokens.extend(sentence.words.iter().copied());
+        }
+    }
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +378,65 @@ mod tests {
         assert_eq!(w.last_rev_id, 1000);
         assert!(w.inbound.is_empty());
         assert!(w.outbound.is_empty());
+    }
+
+    #[test]
+    fn iter_rev_tokens_walks_document_order() {
+        // Hand-build a small revision with two paragraphs, the first
+        // with two sentences. Expected token order: P0.S0.words ++
+        // P0.S1.words ++ P1.S0.words.
+        let mut a = Article::new("Test");
+        let p0 = a.alloc_paragraph("hp0".into(), "".into());
+        let p1 = a.alloc_paragraph("hp1".into(), "".into());
+        let s00 = a.alloc_sentence("hs00".into(), "".into());
+        let s01 = a.alloc_sentence("hs01".into(), "".into());
+        let s10 = a.alloc_sentence("hs10".into(), "".into());
+        let w0 = a.alloc_word("alpha".into(), 1);
+        let w1 = a.alloc_word("beta".into(), 1);
+        let w2 = a.alloc_word("gamma".into(), 2);
+        let w3 = a.alloc_word("delta".into(), 3);
+        a.sentence_mut(s00).words = vec![w0, w1];
+        a.sentence_mut(s01).words = vec![w2];
+        a.sentence_mut(s10).words = vec![w3];
+        a.paragraph_mut(p0).sentences.insert("hs00".into(), vec![s00]);
+        a.paragraph_mut(p0).sentences.insert("hs01".into(), vec![s01]);
+        a.paragraph_mut(p0).ordered_sentences = vec!["hs00".into(), "hs01".into()];
+        a.paragraph_mut(p1).sentences.insert("hs10".into(), vec![s10]);
+        a.paragraph_mut(p1).ordered_sentences = vec!["hs10".into()];
+
+        let mut rev = Revision::default();
+        rev.paragraphs.insert("hp0".into(), vec![p0]);
+        rev.paragraphs.insert("hp1".into(), vec![p1]);
+        rev.ordered_paragraphs = vec!["hp0".into(), "hp1".into()];
+
+        let toks = iter_rev_tokens(&a, &rev);
+        assert_eq!(toks, vec![w0, w1, w2, w3]);
+    }
+
+    #[test]
+    fn iter_rev_tokens_handles_duplicate_paragraph_hashes() {
+        // Same paragraph hash appearing twice in ordered_paragraphs.
+        // Bucket has two entries; each occurrence picks its own.
+        let mut a = Article::new("Test");
+        let p_first = a.alloc_paragraph("dup".into(), "".into());
+        let p_second = a.alloc_paragraph("dup".into(), "".into());
+        let s_a = a.alloc_sentence("sa".into(), "".into());
+        let s_b = a.alloc_sentence("sb".into(), "".into());
+        let w_a = a.alloc_word("aa".into(), 1);
+        let w_b = a.alloc_word("bb".into(), 1);
+        a.sentence_mut(s_a).words = vec![w_a];
+        a.sentence_mut(s_b).words = vec![w_b];
+        a.paragraph_mut(p_first).sentences.insert("sa".into(), vec![s_a]);
+        a.paragraph_mut(p_first).ordered_sentences = vec!["sa".into()];
+        a.paragraph_mut(p_second).sentences.insert("sb".into(), vec![s_b]);
+        a.paragraph_mut(p_second).ordered_sentences = vec!["sb".into()];
+
+        let mut rev = Revision::default();
+        rev.paragraphs.insert("dup".into(), vec![p_first, p_second]);
+        rev.ordered_paragraphs = vec!["dup".into(), "dup".into()];
+
+        let toks = iter_rev_tokens(&a, &rev);
+        // First "dup" → p_first → "aa"; second "dup" → p_second → "bb".
+        assert_eq!(toks, vec![w_a, w_b]);
     }
 }

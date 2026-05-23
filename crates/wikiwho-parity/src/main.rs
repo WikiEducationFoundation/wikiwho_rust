@@ -23,13 +23,21 @@
 //!   parity-check en/534366             # run a single article
 //!   parity-check --fixtures path/to/   # alternative fixtures root
 //!   parity-check --show-first-diff     # print first divergence per fixture
+//!   parity-check --full-history        # opt-in multi-rev mode: feed every
+//!                                      # rev from history.jsonl in order
+//!                                      # and compare metadata (o_rev_id,
+//!                                      # inbound, outbound), not just
+//!                                      # token strings
+//!
+//! Full-history mode requires `history.jsonl` per fixture
+//! (`scripts/capture_history.py`). Fixtures without history are skipped
+//! with a note.
 //!
 //! Future work:
-//!   - True algorithm parity: requires multi-revision input (full
-//!     history up to the target rev_id) and the ported algorithm.
-//!     For now we exercise only the input side of the pipeline.
 //!   - Machine-readable JSON summary so session notes can be
 //!     auto-populated.
+//!   - Production endpoint compare-to-spec: serve our Article via the
+//!     wire format from API.md and diff full JSON responses.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -63,18 +71,37 @@ struct TokenEntry {
     // against; deserializing-by-allow-extras keeps this forgiving.
     #[serde(rename = "str")]
     text: String,
+    // The remaining fields are only present in fixtures captured with
+    // the full parameter set (which our `capture_fixtures.py` does).
+    // Missing → None, used only by `--full-history` mode.
+    #[serde(default)]
+    o_rev_id: Option<u64>,
+    #[serde(default, rename = "in")]
+    inbound: Vec<u64>,
+    #[serde(default, rename = "out")]
+    outbound: Vec<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Meta {
     lang: String,
-    // title is captured for completeness but not currently used by the
-    // stub. The future comparator will use it when emitting per-fixture
-    // diff reports.
-    #[allow(dead_code)]
     title: String,
     page_id: u64,
     rev_id: u64,
+}
+
+/// One line of `history.jsonl` (see `scripts/capture_history.py`).
+#[derive(Debug, Deserialize)]
+struct HistoryEntry {
+    rev_id: u64,
+    timestamp: String,
+    sha1: Option<String>,
+    comment: Option<String>,
+    minor: bool,
+    user_id: Option<u64>,
+    user_name: Option<String>,
+    text: String,
+    text_hidden: bool,
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +112,15 @@ struct Tally {
     tokens_total: u64,
     tokens_passing: u64,
     fixtures_failed_to_load: u64,
+    // Per-field counters: only incremented in full-history mode.
+    // `tokens_str_passing` is the same metric as `tokens_passing` —
+    // duplicated here so the per-field report reads cleanly.
+    tokens_str_passing: u64,
+    tokens_o_rev_id_passing: u64,
+    tokens_inbound_passing: u64,
+    tokens_outbound_passing: u64,
+    tokens_all_passing: u64,
+    full_history: bool,
 }
 
 impl Tally {
@@ -99,6 +135,11 @@ impl Tally {
         self.revisions_passing += c.rev_passing;
         self.tokens_total += c.token_count;
         self.tokens_passing += c.token_passing;
+        self.tokens_str_passing += c.token_passing;
+        self.tokens_o_rev_id_passing += c.o_rev_id_passing;
+        self.tokens_inbound_passing += c.inbound_passing;
+        self.tokens_outbound_passing += c.outbound_passing;
+        self.tokens_all_passing += c.all_fields_passing;
     }
 
     fn report(&self, elapsed_ms: u128) {
@@ -128,17 +169,61 @@ impl Tally {
             self.tokens_total,
             pct(self.tokens_passing, self.tokens_total),
         );
+        if self.full_history {
+            println!(
+                "  ├─ str:             {} / {} ({}%)",
+                self.tokens_str_passing,
+                self.tokens_total,
+                pct(self.tokens_str_passing, self.tokens_total),
+            );
+            println!(
+                "  ├─ o_rev_id:        {} / {} ({}%)",
+                self.tokens_o_rev_id_passing,
+                self.tokens_total,
+                pct(self.tokens_o_rev_id_passing, self.tokens_total),
+            );
+            println!(
+                "  ├─ inbound:         {} / {} ({}%)",
+                self.tokens_inbound_passing,
+                self.tokens_total,
+                pct(self.tokens_inbound_passing, self.tokens_total),
+            );
+            println!(
+                "  ├─ outbound:        {} / {} ({}%)",
+                self.tokens_outbound_passing,
+                self.tokens_total,
+                pct(self.tokens_outbound_passing, self.tokens_total),
+            );
+            println!(
+                "  └─ all-fields:      {} / {} ({}%)",
+                self.tokens_all_passing,
+                self.tokens_total,
+                pct(self.tokens_all_passing, self.tokens_total),
+            );
+        }
         println!("  elapsed:            {} ms", elapsed_ms);
         println!();
-        println!(
-            "  note: cascade single-rev parity. The full paragraph + \
-             sentence + insertion-only token cascade runs end-to-end on \
-             each fixture, but `o_rev_id` / `token_id` / `in` / `out` \
-             aren't compared yet — single-rev fixtures can't validate \
-             them. Headline percentage matches tokenizer-only because \
-             the cascade walks the same splitter. Move to multi-rev \
-             fixtures to make this number meaningful."
-        );
+        if self.full_history {
+            println!(
+                "  note: full-history parity. Each fixture's history.jsonl \
+                 is replayed in order through Article::analyse_revision; \
+                 the final-revision token stream is then compared to the \
+                 production wikiwho-api output. The all-fields percentage \
+                 is the real algorithm-parity number — anything below \
+                 100% is either a divergence we accept (Myers vs Differ \
+                 tie-breaking on duplicates) or a bug to investigate."
+            );
+        } else {
+            println!(
+                "  note: cascade single-rev parity. The full paragraph + \
+                 sentence + insertion-only token cascade runs end-to-end on \
+                 each fixture, but `o_rev_id` / `token_id` / `in` / `out` \
+                 aren't compared yet — single-rev fixtures can't validate \
+                 them. Pass --full-history (and run \
+                 scripts/capture_history.py first) to enable the multi-rev \
+                 ratchet."
+            );
+        }
     }
 }
 
@@ -148,6 +233,11 @@ struct ComparisonResult {
     rev_passing: u64,
     token_count: u64,
     token_passing: u64,
+    o_rev_id_passing: u64,
+    inbound_passing: u64,
+    outbound_passing: u64,
+    /// Tokens where str AND o_rev_id AND in AND out all match.
+    all_fields_passing: u64,
     /// First divergence as `(position, rust, expected)` — populated
     /// for diagnostics, only printed when `--show-first-diff` is set.
     first_diff: Option<(usize, String, String)>,
@@ -197,6 +287,84 @@ fn compare(rust: &[String], expected: &[TokenEntry]) -> ComparisonResult {
         token_passing,
         first_diff,
         length_mismatch,
+        ..Default::default()
+    }
+}
+
+/// Full-history comparison: walks every token position and counts
+/// per-field passing as well as a strict "all fields match" predicate.
+///
+/// Rust input is a slice of `&Word` pulled from `iter_rev_tokens` on
+/// the target revision; expected is the production wikiwho-api token
+/// list. The two are expected to be the same length; if not, the
+/// shorter side bounds the iteration and the missing positions count
+/// as failing for every field.
+fn compare_full(
+    rust: &[&wikiwho_attribute::structures::Word],
+    expected: &[TokenEntry],
+) -> ComparisonResult {
+    let token_count = expected.len() as u64;
+    let mut token_passing = 0u64;
+    let mut o_rev_id_passing = 0u64;
+    let mut inbound_passing = 0u64;
+    let mut outbound_passing = 0u64;
+    let mut all_fields_passing = 0u64;
+    let mut first_diff = None;
+
+    for (i, exp) in expected.iter().enumerate() {
+        let Some(got) = rust.get(i) else {
+            if first_diff.is_none() {
+                first_diff = Some((i, String::new(), exp.text.clone()));
+            }
+            continue;
+        };
+        let str_ok = got.value == exp.text;
+        if str_ok {
+            token_passing += 1;
+        } else if first_diff.is_none() {
+            first_diff = Some((i, got.value.clone(), exp.text.clone()));
+        }
+
+        let o_ok = exp.o_rev_id.map(|exp_id| exp_id == got.origin_rev_id).unwrap_or(true);
+        if o_ok {
+            o_rev_id_passing += 1;
+        }
+        let in_ok = exp.inbound == got.inbound;
+        if in_ok {
+            inbound_passing += 1;
+        }
+        let out_ok = exp.outbound == got.outbound;
+        if out_ok {
+            outbound_passing += 1;
+        }
+        if str_ok && o_ok && in_ok && out_ok {
+            all_fields_passing += 1;
+        }
+    }
+
+    let length_mismatch = if rust.len() == expected.len() {
+        None
+    } else {
+        Some((rust.len(), expected.len()))
+    };
+
+    let rev_passing = if length_mismatch.is_none() && all_fields_passing == token_count {
+        1
+    } else {
+        0
+    };
+
+    ComparisonResult {
+        rev_count: 1,
+        rev_passing,
+        token_count,
+        token_passing,
+        o_rev_id_passing,
+        inbound_passing,
+        outbound_passing,
+        all_fields_passing,
+        first_diff,
+        length_mismatch,
     }
 }
 
@@ -216,6 +384,7 @@ struct Args {
     fixtures: PathBuf,
     filters: Vec<String>,
     show_first_diff: bool,
+    full_history: bool,
 }
 
 fn parse_args() -> Args {
@@ -224,6 +393,7 @@ fn parse_args() -> Args {
         fixtures: default_fixtures_root(),
         filters: Vec::new(),
         show_first_diff: false,
+        full_history: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -234,11 +404,13 @@ fn parse_args() -> Args {
                     .expect("--fixtures requires a path");
             }
             "--show-first-diff" => out.show_first_diff = true,
+            "--full-history" => out.full_history = true,
             "-h" | "--help" => {
                 eprintln!("{}", env!("CARGO_PKG_DESCRIPTION"));
                 eprintln!();
                 eprintln!(
-                    "Usage: parity-check [--fixtures DIR] [--show-first-diff] [LANG/PAGE_ID ...]"
+                    "Usage: parity-check [--fixtures DIR] [--show-first-diff] \
+                     [--full-history] [LANG/PAGE_ID ...]"
                 );
                 std::process::exit(0);
             }
@@ -431,11 +603,184 @@ fn process_one(fixture: &Path, args: &Args, tally: &mut Tally) -> Result<()> {
     Ok(())
 }
 
+fn process_one_full_history(fixture: &Path, args: &Args, tally: &mut Tally) -> Result<()> {
+    let meta_path = fixture.join("meta.json");
+    let rc_path = fixture.join("rev_content.json");
+    let history_path = fixture.join("history.jsonl");
+    if !meta_path.exists() || !rc_path.exists() {
+        bail!("{} missing meta.json and/or rev_content.json", fixture.display());
+    }
+    if !history_path.exists() {
+        bail!(
+            "{} missing history.jsonl — run scripts/capture_history.py first",
+            fixture.display()
+        );
+    }
+    let meta = load_meta(&meta_path)?;
+    let rc = load_rev_content(&rc_path)?;
+
+    if !rc.success {
+        bail!(
+            "{}/{} rev_content.success=false; refusing to parity-check",
+            meta.lang,
+            meta.rev_id
+        );
+    }
+    if rc.page_id != meta.page_id {
+        bail!(
+            "{}: meta page_id={} disagrees with rev_content page_id={}",
+            fixture.display(),
+            meta.page_id,
+            rc.page_id
+        );
+    }
+
+    let history_text = fs::read_to_string(&history_path)
+        .with_context(|| format!("reading {}", history_path.display()))?;
+    let entries: Vec<HistoryEntry> = history_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str::<HistoryEntry>(l)
+                .with_context(|| format!("parsing line of {}", history_path.display()))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut article = wikiwho_attribute::structures::Article::new(&meta.title);
+    article.page_id = Some(meta.page_id);
+    let mut fed = 0u64;
+    let mut skipped_hidden = 0u64;
+    let mut spam_count = 0u64;
+
+    for entry in &entries {
+        if entry.text_hidden {
+            // Mirror wikiwho.py:146 — `texthidden` / `textmissing`
+            // revisions never enter the algorithm.
+            skipped_hidden += 1;
+            continue;
+        }
+        let outcome = article.analyse_revision(wikiwho_attribute::pipeline::RevisionInput {
+            rev_id: entry.rev_id,
+            timestamp: entry.timestamp.clone(),
+            text: entry.text.clone(),
+            sha1: entry.sha1.clone(),
+            comment: entry.comment.clone(),
+            minor: entry.minor,
+            user_id: entry.user_id,
+            user_name: entry.user_name.clone(),
+        });
+        fed += 1;
+        if matches!(
+            outcome,
+            wikiwho_attribute::pipeline::RevisionOutcome::Vandalism(_)
+        ) {
+            spam_count += 1;
+        }
+    }
+
+    // Pull the final revision and compare its token stream.
+    let Some(final_rev) = article.revisions.get(&meta.rev_id) else {
+        bail!(
+            "{}/{} target rev_id={} not in article.revisions after replay \
+             (fed {} of {} input revs, hidden {}, spam {}). Either the \
+             history doesn't actually reach the target, or our algorithm \
+             flagged the target itself as spam.",
+            meta.lang,
+            meta.page_id,
+            meta.rev_id,
+            fed,
+            entries.len(),
+            skipped_hidden,
+            spam_count,
+        );
+    };
+    let final_token_ids = wikiwho_attribute::structures::iter_rev_tokens(&article, final_rev);
+    let rust_words: Vec<&wikiwho_attribute::structures::Word> = final_token_ids
+        .iter()
+        .map(|id| article.word(*id))
+        .collect();
+
+    let mut total = ComparisonResult::default();
+    for rev_map in &rc.revisions {
+        for entry in rev_map.values() {
+            let c = compare_full(&rust_words, &entry.tokens);
+            total.rev_count += c.rev_count;
+            total.rev_passing += c.rev_passing;
+            total.token_count += c.token_count;
+            total.token_passing += c.token_passing;
+            total.o_rev_id_passing += c.o_rev_id_passing;
+            total.inbound_passing += c.inbound_passing;
+            total.outbound_passing += c.outbound_passing;
+            total.all_fields_passing += c.all_fields_passing;
+            if total.first_diff.is_none() {
+                total.first_diff = c.first_diff;
+            }
+            if total.length_mismatch.is_none() {
+                total.length_mismatch = c.length_mismatch;
+            }
+        }
+    }
+
+    let pass_pct_all = if total.token_count == 0 {
+        0.0
+    } else {
+        100.0 * total.all_fields_passing as f64 / total.token_count as f64
+    };
+    let pass_pct_str = if total.token_count == 0 {
+        0.0
+    } else {
+        100.0 * total.token_passing as f64 / total.token_count as f64
+    };
+    let pass_marker = if total.rev_passing == total.rev_count {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    println!(
+        "  [{}] {}/{} {} (rev_id={}) — replayed {} of {} revs ({} hidden, \
+         {} spam) — str {} / {} ({:.2}%), all-fields {} / {} ({:.2}%)",
+        pass_marker,
+        meta.lang,
+        meta.page_id,
+        rc.article_title,
+        meta.rev_id,
+        fed,
+        entries.len(),
+        skipped_hidden,
+        spam_count,
+        total.token_passing,
+        total.token_count,
+        pass_pct_str,
+        total.all_fields_passing,
+        total.token_count,
+        pass_pct_all,
+    );
+    if let Some((rust_len, exp_len)) = total.length_mismatch {
+        println!(
+            "         length: rust={} expected={} (Δ={:+})",
+            rust_len,
+            exp_len,
+            rust_len as i64 - exp_len as i64,
+        );
+    }
+    if args.show_first_diff {
+        if let Some((i, got, exp)) = &total.first_diff {
+            println!("         first str diff @ {}: rust={:?} expected={:?}", i, got, exp);
+        }
+    }
+
+    tally.merge(&total);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = parse_args();
     println!("fixtures root: {}", args.fixtures.display());
     if !args.filters.is_empty() {
         println!("filters:       {}", args.filters.join(", "));
+    }
+    if args.full_history {
+        println!("mode:          full-history (multi-rev replay)");
     }
     let fixtures = walk_fixtures(&args.fixtures, &args.filters)
         .context("walking fixtures directory")?;
@@ -449,9 +794,17 @@ fn main() -> Result<()> {
     println!("loading {} fixture(s):", fixtures.len());
 
     let started = Instant::now();
-    let mut tally = Tally::default();
+    let mut tally = Tally {
+        full_history: args.full_history,
+        ..Tally::default()
+    };
     for fx in &fixtures {
-        if let Err(e) = process_one(fx, &args, &mut tally) {
+        let result = if args.full_history {
+            process_one_full_history(fx, &args, &mut tally)
+        } else {
+            process_one(fx, &args, &mut tally)
+        };
+        if let Err(e) = result {
             eprintln!("  SKIP {}: {:#}", fx.display(), e);
             tally.add_load_failure();
         }

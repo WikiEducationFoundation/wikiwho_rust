@@ -790,6 +790,19 @@ pub fn record_inbound_outbound(
     // For sentence-level matches (including the tail-loop additions
     // that overlap unmatched_sentences_prev), iterate words and
     // update only those that survived AND weren't deleted in this rev.
+    //
+    // A word can be reachable from BOTH `matched_paragraphs_prev`'s
+    // sentence walk AND `matched_sentences_prev`'s direct word walk
+    // — e.g., when a curr paragraph matches via `paragraphs_ht` (so
+    // its words are added to `matched.tokens` AND its old sentence is
+    // listed in matched_paragraphs_prev) while a different
+    // unmatched-prev paragraph's sentence ALSO contains the same
+    // words (via prior Myers-keep matching) and ends up in
+    // matched_sentences_prev via the analyse_sentences_in_paragraphs
+    // tail loop. Python avoids double-counting via the `matched`
+    // flag reset (set to False after the first walk visits the word);
+    // we use an explicit `processed` set.
+    let mut processed: std::collections::HashSet<TokenId> = std::collections::HashSet::new();
 
     for &pid in &out.matched_paragraphs_prev {
         let sentence_ids: Vec<SentenceId> = article
@@ -805,6 +818,7 @@ pub fn record_inbound_outbound(
                     article,
                     wid,
                     &out.matched_token_ids,
+                    &mut processed,
                     revision_prev_id,
                     revision_curr_id,
                 );
@@ -819,6 +833,7 @@ pub fn record_inbound_outbound(
                 article,
                 wid,
                 &out.matched_token_ids,
+                &mut processed,
                 revision_prev_id,
                 revision_curr_id,
             );
@@ -826,15 +841,26 @@ pub fn record_inbound_outbound(
     }
 }
 
-/// Apply the `wikiwho.py:280-284` update rule to a single word.
+/// Apply the `wikiwho.py:280-284` update rule to a single word, and
+/// add it to `processed` so subsequent walks skip it. This is the
+/// equivalent of the Python `word_prev.matched = False` reset after
+/// the update: a word can appear in multiple matched lists (via the
+/// sentence-cascade tail loop double-listing or paragraph-vs-sentence
+/// overlap), and the update should apply exactly once.
 fn update_inbound_and_last_rev_id(
     article: &mut Article,
     wid: TokenId,
     matched_token_ids: &std::collections::HashSet<TokenId>,
+    processed: &mut std::collections::HashSet<TokenId>,
     revision_prev_id: crate::structures::RevId,
     revision_curr_id: crate::structures::RevId,
 ) {
     if !matched_token_ids.contains(&wid) {
+        return;
+    }
+    if !processed.insert(wid) {
+        // Already touched this rev — Python's `if word_prev.matched`
+        // would also short-circuit here.
         return;
     }
     let word = article.word_mut(wid);
