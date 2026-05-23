@@ -89,18 +89,38 @@ Dashboard's query params.
 
 ## Status
 
-Framework laid down 2026-05-22; no Rust code yet. The repo contains the
-five strategy docs (this README + PLAN/ALGORITHM/API/STORAGE), a
+Active development. Two crates land so far:
+
+- **`wikiwho-attribute`** — algorithm port + wire-format response
+  builder. Full Differ-based cascade in place. **100 % full-history
+  parity vs the Python reference** on every captured fixture
+  (en/Photosynthesis, en/Israel-Hamas war, en/Adolf_Hitler, en/Paris,
+  en/Jesse_Owens, de/Berlin, ar/Cairo, simple/Wikipedia, zh/中国 —
+  collectively ~77 k revisions). `response::build_rev_content`
+  produces the API.md §1-6 JSON envelope from in-memory `Article`
+  state; validated structurally against `python_replay.json` fixtures.
+- **`wikiwho-mwclient`** — async MW Action API client (tokio + reqwest).
+  Revision-history fetcher with 429-Retry-After-honoring + 5xx
+  exponential backoff. `capture-history` binary is a drop-in
+  replacement for `scripts/capture_history.py` (round-trip-tested
+  on existing fixtures).
+
+Still to come (per [PLAN.md §9](PLAN.md)): `wikiwho-storage`,
+`wikiwho-server`, `wikiwho-ingest`.
+
+Supporting machinery: the `wikiwho-parity` binary (which has both
+`--full-history` and `--python-replay` ground-truth modes), five
+strategy docs (this README + PLAN/ALGORITHM/API/STORAGE), a
 [CLAUDE.md](CLAUDE.md) with the autonomy posture for Claude-driven
-iteration, `.claude/settings.json` with development-loop permissions, a
-parity-fixture capture script (`scripts/capture_fixtures.py`), the
-fixtures themselves under `parity-fixtures/` (gitignored — regeneratable
-from production wikiwho-api), and `notes/` for session logs +
+iteration, `.claude/settings.json` with development-loop permissions,
+the parity-fixture capture scripts under `scripts/`, the fixtures
+themselves under `parity-fixtures/` (gitignored — regeneratable from
+production wikiwho-api), and `notes/` for session logs +
 decisions-needed queue.
 
 Next session should read [CLAUDE.md](CLAUDE.md) first, then the latest
-file under `notes/`, then begin standing up the `wikiwho-attribute`
-crate per [PLAN.md §9](PLAN.md).
+file under `notes/` for current parity numbers + next-step
+recommendation.
 
 ## A note on language choice and the author's Rust experience
 
