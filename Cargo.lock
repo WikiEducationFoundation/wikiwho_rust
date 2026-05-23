@@ -1608,6 +1608,7 @@ dependencies = [
 name = "wikiwho-storage"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "crc32fast",
  "serde",
  "serde_json",

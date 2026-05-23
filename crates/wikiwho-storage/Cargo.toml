@@ -8,6 +8,7 @@ publish.workspace = true
 description = "On-disk blob format for token-level authorship state. Implements the layout in STORAGE.md and supports the lazy single-revision read path."
 
 [dependencies]
+anyhow = { workspace = true }
 crc32fast = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -16,3 +17,7 @@ wikiwho-attribute = { path = "../wikiwho-attribute" }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bin]]
+name = "rebuild_rev_index"
+path = "src/bin/rebuild_rev_index.rs"

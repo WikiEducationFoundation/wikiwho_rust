@@ -31,6 +31,8 @@ pub mod hashtables;
 pub mod layout;
 pub mod meta;
 pub mod reader;
+pub mod rebuild;
+pub mod rev_id_index;
 pub mod revisions;
 pub mod strings;
 pub mod tokens;

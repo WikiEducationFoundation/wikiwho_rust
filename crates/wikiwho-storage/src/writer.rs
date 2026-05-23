@@ -29,6 +29,7 @@ use wikiwho_attribute::structures::{Article, iter_rev_tokens};
 use crate::hashtables::HashTables;
 use crate::layout::{article_dir, HASHTABLES_FILE, META_FILE, REVISIONS_FILE, STRINGS_FILE, TOKENS_FILE};
 use crate::meta::Meta;
+use crate::rev_id_index::RevIdIndex;
 use crate::revisions::{write_revisions, StoredRevision};
 use crate::strings::write_strings;
 use crate::tokens::{write_tokens, StoredToken};
@@ -55,6 +56,15 @@ pub fn write_article(article: &Article, volume: &Path, language: &str) -> Result
     write_revisions_file(&dir, &revisions)?;
     write_hashtables_file(&dir, &hashtables)?;
     write_meta_file(&dir, &meta)?;
+
+    // Per-language `rev_id_index.bin` sidecar. This is the authoritative
+    // map endpoint 1 (`/rev_content/rev_id/{rev_id}/`) reads from.
+    // Write order matters: the article's per-article files must exist
+    // before we publish its rev_ids to the index, so a concurrent
+    // reader chasing a new rev_id always finds the article files on
+    // disk. (Reverse order would expose a tiny window where the index
+    // points at an article that's still being written.)
+    RevIdIndex::update_for_article(volume, language, page_id, &article.ordered_revisions)?;
 
     Ok(dir)
 }
@@ -290,6 +300,82 @@ mod tests {
         }
         // Verify sharding: en/0/0/7
         assert!(dir.ends_with("en/0/0/7"), "actual: {dir:?}");
+    }
+
+    #[test]
+    fn write_article_updates_rev_id_index() {
+        let article = fixture_article();
+        let tmp = tempfile::tempdir().unwrap();
+        write_article(&article, tmp.path(), "en").unwrap();
+
+        let index = RevIdIndex::load(tmp.path(), "en").unwrap();
+        // Fixture has two revisions: 101 and 102, both for page_id 7.
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.lookup(101), Some(7));
+        assert_eq!(index.lookup(102), Some(7));
+        assert_eq!(index.lookup(999), None);
+    }
+
+    #[test]
+    fn write_article_for_two_articles_merges_into_one_index() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // First article: page_id 7, revs 101 + 102.
+        let a1 = fixture_article();
+        write_article(&a1, tmp.path(), "en").unwrap();
+
+        // Second article: different page_id, different rev_ids.
+        let mut a2 = Article::new("Other");
+        a2.page_id = Some(42);
+        a2.analyse_revision(RevisionInput {
+            rev_id: 9001,
+            timestamp: "2024-02-01T00:00:00Z".into(),
+            user_id: Some(33),
+            user_name: Some("u33".into()),
+            comment: None,
+            minor: false,
+            sha1: None,
+            text: "Independent article content.".into(),
+        });
+        write_article(&a2, tmp.path(), "en").unwrap();
+
+        let index = RevIdIndex::load(tmp.path(), "en").unwrap();
+        assert_eq!(index.len(), 3);
+        assert_eq!(index.lookup(101), Some(7));
+        assert_eq!(index.lookup(102), Some(7));
+        assert_eq!(index.lookup(9001), Some(42));
+    }
+
+    #[test]
+    fn rewriting_article_replaces_its_rev_ids_in_index() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Initial write: two revs.
+        let a1 = fixture_article();
+        write_article(&a1, tmp.path(), "en").unwrap();
+        assert_eq!(RevIdIndex::load(tmp.path(), "en").unwrap().len(), 2);
+
+        // Pretend the article picked up a third revision: rewrite from
+        // scratch with one extra rev. The old rev_ids should be replaced,
+        // not duplicated.
+        let mut a2 = fixture_article();
+        a2.analyse_revision(RevisionInput {
+            rev_id: 103,
+            timestamp: "2024-01-03T00:00:00Z".into(),
+            user_id: Some(33),
+            user_name: Some("u33".into()),
+            comment: None,
+            minor: false,
+            sha1: None,
+            text: "Hello there, dear friend.".into(),
+        });
+        write_article(&a2, tmp.path(), "en").unwrap();
+
+        let index = RevIdIndex::load(tmp.path(), "en").unwrap();
+        assert_eq!(index.len(), 3, "no duplicates expected, just the 3 revs");
+        assert_eq!(index.lookup(101), Some(7));
+        assert_eq!(index.lookup(102), Some(7));
+        assert_eq!(index.lookup(103), Some(7));
     }
 
     #[test]

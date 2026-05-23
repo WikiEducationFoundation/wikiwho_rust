@@ -10,10 +10,10 @@
 //! Then we call [`wikiwho_attribute::response::build_rev_content`] on
 //! a [`SnapshotReader`]-hydrated `Article` and return the JSON.
 //!
-//! Endpoint 1 (`/rev_content/rev_id/{rev_id}/`) needs a `rev_id ->
-//! page_id` index that isn't built yet. We respond with the "still
-//! processing" envelope so the Impact Visualizer's existing retry
-//! behavior fires. See `notes/decisions-needed.md`.
+//! Endpoint 1 (`/rev_content/rev_id/{rev_id}/`) resolves the rev_id to
+//! a page_id via the per-language `rev_id_index.bin` sidecar (loaded
+//! lazily by [`AppState::resolve_rev_id`]), then re-uses the same
+//! page_id path as endpoints 4/6.
 
 use axum::{
     Json,
@@ -71,22 +71,25 @@ pub struct TitleRevPath {
 
 /// Endpoint 1: rev_content by rev_id only.
 ///
-/// Without a `rev_id -> page_id` index we cannot resolve the article
-/// in O(1). The lazy fallback would be a full storage scan, which is
-/// not appropriate for production. Until the index exists, return the
-/// API.md §1 "still processing" envelope (HTTP 408) so the Impact
-/// Visualizer client treats this as "skip this article".
+/// Resolves the rev_id to a page_id via the per-language
+/// `rev_id_index.bin` sidecar, then delegates to the standard page_id
+/// path with `target_rev_id = Some(rev_id)`. If the index has no entry
+/// for this rev_id we return the "still processing" envelope so the
+/// Impact Visualizer client treats it as "skip this article".
 pub async fn rev_content_by_rev_id(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(path): Path<RevIdPath>,
-    Query(_params): Query<RawTokenParams>,
+    Query(params): Query<RawTokenParams>,
 ) -> Response {
-    tracing::warn!(
-        lang = %path.lang,
-        rev_id = path.rev_id,
-        "rev_content/rev_id/ requested but rev_id->page_id index not yet implemented"
-    );
-    still_processing()
+    let Some(page_id) = state.resolve_rev_id(&path.lang, path.rev_id) else {
+        tracing::debug!(
+            lang = %path.lang,
+            rev_id = path.rev_id,
+            "rev_id not present in rev_id_index.bin"
+        );
+        return still_processing();
+    };
+    handle_page_id(state, &path.lang, page_id, Some(path.rev_id), params).await
 }
 
 /// Endpoint 4 + 6: latest revision by page_id (also handles the case

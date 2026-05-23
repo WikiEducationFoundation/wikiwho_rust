@@ -346,6 +346,19 @@ impl<'a> RevisionsIndex<'a> {
     pub fn iter_by_rev_id(&self) -> RevisionsIndexIter<'a, '_> {
         RevisionsIndexIter { idx: self, i: 0 }
     }
+
+    /// Cheap walk over just the rev_ids in the index table — no varint
+    /// decoding of any revision body. Useful for sidecar-index rebuilds
+    /// that only need `(rev_id, page_id)` pairs.
+    pub fn rev_ids_sorted(&self) -> Vec<u64> {
+        let entry_size = 12usize;
+        let mut out = Vec::with_capacity(self.n_revisions);
+        for i in 0..self.n_revisions {
+            let entry = self.index_start + i * entry_size;
+            out.push(read_u64_be(&self.payload[entry..entry + 8]));
+        }
+        out
+    }
 }
 
 pub struct RevisionsIndexIter<'a, 'i> {

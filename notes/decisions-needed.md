@@ -64,6 +64,22 @@ endpoint 1. Until this lands, IV testing against the rewrite will hit
 the 408 placeholder. Non-blocking because Dashboard / XTools / WWT
 all use endpoint 2 (title-based), which works.
 
+> **Resolved 2026-05-23 (part 8):** chose **A**.
+> `crates/wikiwho-storage/src/rev_id_index.rs` implements the sidecar
+> as a 24-byte header + sorted `(u64 rev_id, u64 page_id)` body + 8-byte
+> CRC trailer, written atomically via tmp-file + rename. `write_article`
+> updates it on every per-article write (the in-writer
+> cross-page-collision check surfaces sharing bugs early). The admin
+> command lives at `crates/wikiwho-storage/src/bin/rebuild_rev_index.rs`
+> and reuses `RevisionsIndex::rev_ids_sorted` to extract rev_ids
+> cheaply from each article's `revisions.bin` without decoding token
+> bodies. Server-side: `AppState::resolve_rev_id` lazy-loads the index
+> per language (mirrors the title-index pattern); endpoint 1 now hits
+> the index and delegates to the same code path as endpoints 4/6,
+> falling back to the 408 envelope only when the rev_id is unknown.
+> End-to-end byte-identical JSON for a known rev_id is covered by a
+> new integration test.
+
 ---
 
 ## 2026-05-23 — how to persist paragraph + sentence arenas for resume-from-disk [non-blocking]

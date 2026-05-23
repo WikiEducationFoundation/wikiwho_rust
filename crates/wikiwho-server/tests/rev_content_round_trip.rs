@@ -279,6 +279,99 @@ async fn missing_title_returns_still_processing() {
 }
 
 #[tokio::test]
+async fn rev_content_by_rev_id_round_trip() {
+    // Endpoint 1 — Impact Visualizer's main entry point.
+    // The rev_id is resolved through `rev_id_index.bin` to a page_id,
+    // then rendered the same way endpoints 3/4/6 do.
+    let Some((meta, article)) = load_fixture("zh/1686258/64806634") else {
+        return;
+    };
+    let target_rev = meta.rev_id;
+    let language = meta.lang.clone();
+    let page_id = meta.page_id;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_article(&article, tmp.path(), &language).unwrap();
+
+    let expected = build_rev_content(&article, &[target_rev], ResponseParameters::ALL).unwrap();
+    let expected_json = serde_json::to_value(&expected).unwrap();
+
+    let state = AppState::new(tmp.path().to_path_buf());
+    state.refresh_rev_id_index(&language).unwrap();
+    let base = spawn_server(state).await;
+
+    let url = format!(
+        "{base}/{lang}/api/v1.0.0-beta/rev_content/rev_id/{rev_id}/?o_rev_id=true&editor=true&token_id=true&in=true&out=true",
+        lang = language,
+        rev_id = target_rev,
+    );
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), 200, "endpoint 1 should resolve via rev_id_index.bin");
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body, expected_json, "endpoint 1 body diverged");
+    assert_eq!(body["page_id"], page_id);
+}
+
+#[tokio::test]
+async fn rev_content_by_rev_id_unknown_returns_still_processing() {
+    // Same fixture on disk; ask for a rev_id that doesn't exist anywhere
+    // in the index. Should hit the "still processing" placeholder, not
+    // a 500 — Impact Visualizer's client treats 408 as "skip this
+    // article" and tries again later.
+    let Some((meta, article)) = load_fixture("zh/1686258/64806634") else {
+        return;
+    };
+    let language = meta.lang.clone();
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_article(&article, tmp.path(), &language).unwrap();
+
+    let state = AppState::new(tmp.path().to_path_buf());
+    state.refresh_rev_id_index(&language).unwrap();
+    let base = spawn_server(state).await;
+
+    let url = format!(
+        "{base}/{lang}/api/v1.0.0-beta/rev_content/rev_id/9000000000/",
+        lang = language,
+    );
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), 408, "unknown rev_id should mirror missing-article envelope");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("Info").is_some(),
+        "envelope must contain Info field: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rev_content_by_rev_id_uses_lazy_index_load() {
+    // No explicit refresh_rev_id_index call: the first request must
+    // build the cache lazily, just like the title-index path does.
+    let Some((meta, article)) = load_fixture("zh/1686258/64806634") else {
+        return;
+    };
+    let target_rev = meta.rev_id;
+    let language = meta.lang.clone();
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_article(&article, tmp.path(), &language).unwrap();
+
+    let state = AppState::new(tmp.path().to_path_buf());
+    // NOTE: no state.refresh_rev_id_index(...) here.
+    let base = spawn_server(state).await;
+
+    let url = format!(
+        "{base}/{lang}/api/v1.0.0-beta/rev_content/rev_id/{rev_id}/",
+        lang = language,
+        rev_id = target_rev,
+    );
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), 200, "lazy index load should serve endpoint 1");
+}
+
+#[tokio::test]
 async fn rev_content_token_field_filtering() {
     let Some((meta, article)) = load_fixture("zh/1686258/64806634") else {
         return;
