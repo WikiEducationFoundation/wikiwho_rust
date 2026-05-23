@@ -10,17 +10,18 @@
 //! Then we call [`wikiwho_attribute::response::build_rev_content`] on
 //! a [`SnapshotReader`]-hydrated `Article` and return the JSON.
 //!
-//! **Cache-miss path (PLAN.md §280-287):** for endpoints 2-6, if the
+//! **Cache-miss path (PLAN.md §280-287):** for endpoints 1-6, if the
 //! article isn't on disk the handler does a one-shot MW lookup to
 //! learn `(title, page_id, last_revid)`, spawns a background task to
 //! fetch + replay the full history, and returns the
 //! "still processing" envelope (HTTP 408 — API.md §1) immediately.
 //! Subsequent requests for the same article either see the
 //! in-flight slot and 408 again, or — once processing finishes —
-//! serve from disk. Endpoint 1 (rev_id-only) skips the MW lookup;
-//! Impact Visualizer's existing fixture rev_ids are already in
-//! `rev_id_index.bin` (or, if not, the 408 path triggers a client
-//! retry that hits a title- or page_id-keyed endpoint instead).
+//! serve from disk. Endpoint 1 (rev_id-only) does an extra
+//! `revids=` lookup to learn the article from the rev_id; the
+//! cache-miss task then fetches revisions up through the requested
+//! rev_id (not the article's live tip), matching endpoint 3's
+//! semantics.
 
 use axum::{
     Json,
@@ -89,33 +90,76 @@ struct CacheMissPlan {
 
 /// Endpoint 1: rev_content by rev_id only.
 ///
-/// Resolves the rev_id to a page_id via the per-language
-/// `rev_id_index.bin` sidecar; on hit, delegates to the standard
-/// page_id path. On miss we don't yet have a `rev_id -> page_id` MW
-/// lookup, so we return the 408 envelope.
+/// Three paths:
+///
+/// 1. rev_id is in the per-language `rev_id_index.bin` sidecar →
+///    delegate to the on-disk render with the requested rev_id as the
+///    target (matches endpoint 3's "title + rev_id" snapshot
+///    semantics).
+/// 2. rev_id is not in the sidecar → ask MW to map
+///    `rev_id → (title, page_id)` via `prop=info&revids=...`, then
+///    spawn the cache-miss task with `end_rev_id = rev_id` so the
+///    fetched history terminates at the requested snapshot.
+/// 3. MW says the rev_id doesn't exist (`badrevids`) or any other
+///    failure → return the 408 still-processing envelope.
 pub async fn rev_content_by_rev_id(
     State(state): State<AppState>,
     Path(path): Path<RevIdPath>,
     Query(params): Query<RawTokenParams>,
 ) -> Response {
     let response_params = params.into_response_parameters();
-    let Some(page_id) = state.resolve_rev_id(&path.lang, path.rev_id) else {
-        tracing::debug!(
+    let target_rev_id = Some(path.rev_id);
+
+    // 1. Fast path: rev_id is in the sidecar → page_id known, try
+    //    on-disk.
+    if let Some(page_id) = state.resolve_rev_id(&path.lang, path.rev_id) {
+        if let Some(resp) =
+            try_serve_from_disk(&state, &path.lang, page_id, target_rev_id, response_params)
+        {
+            return resp;
+        }
+        // Indexed but file missing — log + fall through to MW so we
+        // can rebuild.
+        tracing::warn!(
             lang = %path.lang,
+            page_id = page_id,
             rev_id = path.rev_id,
-            "rev_id not in rev_id_index.bin; cache-miss for rev_id-only is deferred"
+            "rev_id indexed but article files missing; will refetch via MW"
         );
+    }
+
+    // 2. Cache miss: ask MW for the (title, page_id) the rev_id
+    //    belongs to. Override `last_revid` with the requested rev_id so
+    //    the fetched history terminates at the requested snapshot.
+    let plan_with_page_id = resolve_via_mw(&state, &path.lang, |mw| {
+        let rev_id = path.rev_id;
+        async move {
+            let info = mw.resolve_rev_id(rev_id).await?;
+            Ok(wikiwho_mwclient::PageInfo {
+                title: info.title,
+                page_id: info.page_id,
+                last_revid: rev_id,
+            })
+        }
+    })
+    .await;
+
+    let Some((page_id, plan)) = plan_with_page_id else {
         return still_processing();
     };
-    serve_or_trigger(
-        state,
-        &path.lang,
-        page_id,
-        Some(path.rev_id),
-        response_params,
-        None,
-    )
-    .await
+
+    // MW gave us the canonical (title, page_id) — try on-disk one more
+    // time in case the article was processed but the rev_id index hadn't
+    // been refreshed.
+    if let Some(resp) =
+        try_serve_from_disk(&state, &path.lang, page_id, target_rev_id, response_params)
+    {
+        if let Err(e) = state.refresh_rev_id_index(&path.lang) {
+            tracing::warn!(lang = %path.lang, error = %e, "rev_id-index refresh failed");
+        }
+        return resp;
+    }
+    cache_miss_response(state, path.lang, page_id, Some(plan))
 }
 
 /// Endpoint 4 + 6: latest revision by page_id.
@@ -273,24 +317,6 @@ fn try_serve_from_disk(
         None => reader.article.ordered_revisions.last().copied()?,
     };
     Some(render(&reader.article, target, params))
-}
-
-/// "Serve from disk, else trigger cache-miss" for the rev_id-keyed
-/// path that doesn't need an MW resolve step (endpoint 1). Endpoints
-/// 2-6 build their `plan` via [`resolve_via_mw`] and call
-/// [`cache_miss_response`] directly.
-async fn serve_or_trigger(
-    state: AppState,
-    lang: &str,
-    page_id: u64,
-    target_rev_id: Option<u64>,
-    params: ResponseParameters,
-    plan: Option<CacheMissPlan>,
-) -> Response {
-    if let Some(resp) = try_serve_from_disk(&state, lang, page_id, target_rev_id, params) {
-        return resp;
-    }
-    cache_miss_response(state, lang.to_string(), page_id, plan)
 }
 
 /// Construct a [`CacheMissPlan`] by asking MW for the article's

@@ -95,6 +95,56 @@ fn missing_page_with_pageid_in_response_surfaces_it() {
 }
 
 #[test]
+fn revids_query_with_bad_revid_returns_page_missing() {
+    // `revids=` queries against MW use `query.badrevids` instead of
+    // `query.pages` when the rev_id doesn't exist. We surface that as
+    // PageMissing so endpoint 1's cache-miss path doesn't try to
+    // process it.
+    let body = json!({
+        "batchcomplete": true,
+        "query": {
+            "badrevids": {
+                "9999999999": {
+                    "revid": 9_999_999_999u64,
+                    "missing": true
+                }
+            }
+        }
+    });
+    match parse_page_info(&body).unwrap_err() {
+        // `page_id` field is 0 because we don't know the page; the
+        // useful identifier in this case is the rev_id, which the
+        // handler has from the request itself.
+        MwError::PageMissing { page_id } => assert_eq!(page_id, 0),
+        other => panic!("expected PageMissing, got {other:?}"),
+    }
+}
+
+#[test]
+fn revids_query_with_known_revid_parses_like_titles() {
+    // The shape MW returns for `prop=info&revids=...` is identical to
+    // the title/page_id queries — same `query.pages[0]` with pageid +
+    // title + lastrevid. `lastrevid` is the *page's* latest, not the
+    // queried rev_id.
+    let body = json!({
+        "batchcomplete": true,
+        "query": {
+            "pages": [{
+                "pageid": 27263,
+                "ns": 0,
+                "title": "Wikipedia",
+                "lastrevid": 10_855_732u64,
+                "length": 17130
+            }]
+        }
+    });
+    let info = parse_page_info(&body).unwrap();
+    assert_eq!(info.page_id, 27263);
+    assert_eq!(info.title, "Wikipedia");
+    assert_eq!(info.last_revid, 10_855_732);
+}
+
+#[test]
 fn body_without_query_errors_as_shape() {
     let body = json!({"batchcomplete": true});
     let err = parse_page_info(&body).unwrap_err();

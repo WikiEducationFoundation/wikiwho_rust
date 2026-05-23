@@ -354,6 +354,111 @@ async fn cache_miss_concurrent_requests_spawn_one_task() {
 }
 
 #[tokio::test]
+async fn cache_miss_by_rev_id_persists_and_serves_byte_identical() {
+    // Endpoint 1: `/rev_content/rev_id/{rev_id}/`. On cold-start the
+    // server has neither a `rev_id_index.bin` entry nor any on-disk
+    // article, so it asks MW for `rev_id → (title, page_id)`, spawns
+    // the cache-miss task with `end_rev_id = rev_id`, and 408s. After
+    // processing, a second request serves byte-identical JSON.
+    let Some(fixture) = load_fixture("zh/1686258/64806634") else {
+        return;
+    };
+    let lang = fixture.meta.lang.clone();
+    let page_id = fixture.meta.page_id;
+    let target_rev = fixture.meta.rev_id;
+
+    let mw_url = spawn_mock_mw(fixture_clone(&fixture)).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = AppState::new(tmp.path().to_path_buf());
+    state.install_mw_client(
+        &lang,
+        MwClientBuilder::for_api_url(&mw_url)
+            .between_batches(Duration::from_millis(1))
+            .build()
+            .unwrap(),
+    );
+    let base = spawn_server(state.clone()).await;
+
+    let url = format!(
+        "{base}/{lang}/api/v1.0.0-beta/rev_content/rev_id/{target_rev}/?o_rev_id=true&editor=true&token_id=true&in=true&out=true"
+    );
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), 408, "first request should be still-processing");
+
+    wait_for_processing(&state, &lang, page_id).await;
+
+    let expected = build_rev_content(
+        &build_expected_article(&fixture),
+        &[target_rev],
+        ResponseParameters::ALL,
+    )
+    .unwrap();
+    let expected_json = serde_json::to_value(&expected).unwrap();
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), 200, "second request should serve from disk");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body, expected_json);
+}
+
+#[tokio::test]
+async fn cache_miss_by_unknown_rev_id_returns_408_without_spawning() {
+    // MW responds to an unknown rev_id with `query.badrevids`, which
+    // `parse_page_info` maps to `PageMissing`. The handler should 408
+    // and NOT spawn a cache-miss task (no `(title, page_id)` to bind
+    // it to).
+    let Some(fixture) = load_fixture("zh/1686258/64806634") else {
+        return;
+    };
+    let lang = fixture.meta.lang.clone();
+
+    // Custom mock that returns `badrevids` for any prop=info request.
+    let mock_state = MockState {
+        info: Arc::new(json!({
+            "batchcomplete": true,
+            "query": {
+                "badrevids": {
+                    "9999999999": {
+                        "revid": 9_999_999_999u64,
+                        "missing": true
+                    }
+                }
+            }
+        })),
+        revisions: Arc::new(json!({})),
+    };
+    let app = Router::new()
+        .route("/w/api.php", get(mock_handler))
+        .with_state(mock_state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mw_url = format!("http://{addr}/w/api.php");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = AppState::new(tmp.path().to_path_buf());
+    state.install_mw_client(
+        &lang,
+        MwClientBuilder::for_api_url(&mw_url)
+            .between_batches(Duration::from_millis(1))
+            .build()
+            .unwrap(),
+    );
+    let base = spawn_server(state.clone()).await;
+
+    let url = format!(
+        "{base}/{lang}/api/v1.0.0-beta/rev_content/rev_id/9999999999/?o_rev_id=true&editor=true&token_id=true&in=true&out=true"
+    );
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), 408);
+    // Nothing in flight — the handler shouldn't have claimed a slot
+    // (there's no page_id to claim it under). Sanity check: no article
+    // is being processed for the fixture's page_id.
+    assert!(!state.is_in_flight(&lang, fixture.meta.page_id));
+}
+
+#[tokio::test]
 async fn cache_miss_no_mw_client_returns_408_without_spawning() {
     // No `install_mw_client` call and no real network — the production
     // `MwClient::new(lang)` builder still succeeds (it just constructs

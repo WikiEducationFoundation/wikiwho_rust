@@ -157,6 +157,30 @@ impl MwClient {
         parse_page_info(&body)
     }
 
+    /// Resolve a `rev_id` to a [`PageInfo`] via the Action API. Used
+    /// by endpoint 1's cache-miss path (`/rev_content/rev_id/{rev_id}/`)
+    /// to learn the article the rev_id belongs to without taking a
+    /// round-trip through the title or page_id endpoints first.
+    ///
+    /// The returned `last_revid` is MW's view of the **page's** current
+    /// latest, not the queried rev_id. Endpoint 1's handler overrides
+    /// it with the request's rev_id so the cache-miss fetch stops at
+    /// the requested snapshot rather than the live tip.
+    pub async fn resolve_rev_id(&self, rev_id: u64) -> Result<PageInfo> {
+        let rev_id_s = rev_id.to_string();
+        let body = self
+            .request_json(&[
+                ("action", "query"),
+                ("format", "json"),
+                ("formatversion", "2"),
+                ("prop", "info"),
+                ("inprop", "lastrevid"),
+                ("revids", rev_id_s.as_str()),
+            ])
+            .await?;
+        parse_page_info(&body)
+    }
+
     /// Resume an in-progress fetch from a saved `rvcontinue` token.
     /// Use when continuing an article whose previous batches have
     /// already been processed and stored.
