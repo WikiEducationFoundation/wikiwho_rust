@@ -20,6 +20,52 @@ Format:
 
 ---
 
+## 2026-05-23 — rev_id → page_id index for endpoint 1 [non-blocking]
+
+**Context:** The `wikiwho-server` scaffold lands endpoints 2-6 (title /
+page_id paths) end-to-end with byte-identical JSON round-trip against
+the storage layer. **Endpoint 1** (`/{lang}/api/v1.0.0-beta/rev_content/
+rev_id/{rev_id}/`) — used by Impact Visualizer — needs a `rev_id →
+page_id` index that the current storage format does not provide. The
+handler currently responds with the API.md §1 "still processing" (408)
+envelope so consumer retry behavior fires, but that's a placeholder, not
+a fix.
+
+Three places we could put the index:
+
+**Options:**
+- **A. Per-language `rev_id_index.bin` sidecar built by the writer.**
+  Every `write_article` updates a language-wide file mapping
+  `rev_id → page_id` (could be a sorted u64 pair file with binary
+  search). Pros: O(log N) lookup, cheap to update incrementally with the
+  append-log when we land Strategy B writes. Cons: another file in the
+  storage layout; concurrent writers need locking.
+- **B. Brute-force scan on first cold lookup, cached in-memory.**
+  On the first request for a rev_id we don't know, walk every article
+  in the language directory and read each `revisions.bin`'s rev-id
+  index table. Cache the resulting map. Pros: zero new on-disk format.
+  Cons: first-request latency proportional to corpus size — fine for
+  scaffolding (5-10 fixtures) but terrible at en-scale (8M articles).
+- **C. Embed the index in `meta.json`** as a `(first_rev_id,
+  last_rev_id)` range. Useful for "could this article contain this
+  rev_id?" prefilter but not a hash-map replacement. Could combine
+  with B as a cheap rejection filter.
+
+**Recommendation:** **A**, paired with a one-time `rebuild-rev-index`
+admin command that scans the storage tree and produces the index file
+for existing data. The format is tiny — `u64 rev_id, u64 page_id`
+pairs sorted by rev_id, ~16 bytes per revision. For en's ~700M
+revisions that's ~11 GB on disk; very tractable. For per-language
+writes this also gives us a single place to detect duplicate rev_ids
+(spam re-applying across articles) cheaply.
+
+Worth surfacing now because Impact Visualizer's main code path hits
+endpoint 1. Until this lands, IV testing against the rewrite will hit
+the 408 placeholder. Non-blocking because Dashboard / XTools / WWT
+all use endpoint 2 (title-based), which works.
+
+---
+
 ## 2026-05-23 — how to persist paragraph + sentence arenas for resume-from-disk [non-blocking]
 
 **Context:** This session landed `wikiwho-storage`'s read-side (strings,

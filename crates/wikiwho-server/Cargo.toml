@@ -1,0 +1,30 @@
+[package]
+name = "wikiwho-server"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "HTTP service for the rewritten wikiwho-api. Serves the wire format documented in API.md atop the storage layer."
+
+[dependencies]
+anyhow = { workspace = true }
+axum = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+wikiwho-attribute = { path = "../wikiwho-attribute" }
+wikiwho-storage = { path = "../wikiwho-storage" }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = "3"
+
+[[bin]]
+name = "wikiwho-server"
+path = "src/bin/wikiwho_server.rs"
