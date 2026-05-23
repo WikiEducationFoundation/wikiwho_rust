@@ -47,4 +47,9 @@ pub enum ServerError {
     /// be unreachable in practice; included so we never `unwrap()`.
     #[error("json serialization error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// Catch-all for unexpected handler-internal failures (e.g. a
+    /// background task panicked). 500 at the boundary.
+    #[error("internal error: {0}")]
+    Internal(String),
 }

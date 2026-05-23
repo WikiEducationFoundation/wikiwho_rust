@@ -2,9 +2,10 @@
 //!
 //! Currently implements:
 //! - `rev_content` (§1-6) — `rev_content::*`
+//! - `whocolor` (§7-8) — `whocolor::*`
 //!
 //! Not yet implemented:
-//! - `whocolor` (§7-8)
 //! - Ephemeral non-mainspace (§9)
 
 pub mod rev_content;
+pub mod whocolor;

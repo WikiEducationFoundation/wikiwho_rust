@@ -17,7 +17,7 @@ use axum::Router;
 use axum::routing::get;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::handlers::rev_content;
+use crate::handlers::{rev_content, whocolor};
 use crate::state::AppState;
 
 /// Build the application router rooted at the wiki language segment.
@@ -59,6 +59,19 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/{lang}/api/{version}/latest_rev_content/{title}/",
             get(rev_content::rev_content_by_title),
+        )
+        // Endpoint 7 — `/{lang}/whocolor/{version}/{title}/{rev_id}/`
+        // (per API.md §7; `rev_id == 0` is the slash-in-title
+        // workaround → handler routes to latest).
+        .route(
+            "/{lang}/whocolor/{version}/{title}/{rev_id}/",
+            get(whocolor::whocolor_by_title_rev),
+        )
+        // Endpoint 8 — `/{lang}/whocolor/{version}/{title}/`
+        // (latest revision).
+        .route(
+            "/{lang}/whocolor/{version}/{title}/",
+            get(whocolor::whocolor_by_title_latest),
         )
         .with_state(state)
         .layer(cors)
