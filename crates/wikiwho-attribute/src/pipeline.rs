@@ -12,7 +12,7 @@
 //!   before multi-revision parity numbers can move; queued for the
 //!   session after Myers diff lands.
 
-use crate::cascade::determine_authorship;
+use crate::cascade::{determine_authorship, record_inbound_outbound};
 use crate::spam::{hash_matches_known_spam, length_shrink_is_vandalism};
 use crate::structures::{Article, Hash, RevId, Revision};
 use crate::tokenize::hash_md5;
@@ -153,7 +153,13 @@ impl Article {
             return RevisionOutcome::Vandalism(VandalismReason::TokenDensity);
         }
 
-        // 5. Post-cascade hash-table updates
+        // 5. Post-cascade inbound / outbound recording
+        // (`wikiwho.py:257-305`). Must run BEFORE the hash-table
+        // updates because it touches word state on the same arena
+        // entries.
+        record_inbound_outbound(self, &cascade_out, revision_prev.id, rev_id);
+
+        // 6. Post-cascade hash-table updates
         // (`wikiwho.py:308-323`). Newly-allocated paragraphs and
         // sentences go into the global hash tables; their `value`
         // fields are cleared (the hash is enough for future matching,
@@ -170,12 +176,7 @@ impl Article {
             self.sentence_mut(sid).value.clear();
         }
 
-        // TODO(next session): inbound / outbound recording on words
-        // (`wikiwho.py:257-305`). Single-revision parity is not
-        // affected; multi-rev parity is, and the Myers diff session
-        // will land this alongside the diff.
-
-        // 6. Commit.
+        // 7. Commit.
         self.last_good_rev_id = rev_id;
         self.ordered_revisions.push(rev_id);
         self.revisions.insert(rev_id, revision_curr);
@@ -410,5 +411,243 @@ mod tests {
         assert_eq!(article.spam_ids, vec![100]);
         assert!(article.revisions.is_empty());
         assert_eq!(article.last_good_rev_id, 0);
+    }
+
+    /// Find the first token in the arena whose value equals `value`.
+    /// Helper for tests that want to inspect inbound/outbound history
+    /// on a specific token string.
+    fn find_token(article: &Article, value: &str) -> Option<usize> {
+        article.tokens.iter().position(|w| w.value == value)
+    }
+
+    #[test]
+    fn analyse_revision_mid_sentence_edit_runs_myers_diff() {
+        // Mid-sentence word swap is the canonical Myers path: paragraph
+        // and sentence hashes both miss, so the token cascade runs the
+        // diff. Verify the kept tokens reuse their ids, the new token
+        // is allocated fresh, and the deleted token records outbound.
+        let mut article = Article::new("Test");
+        article.analyse_revision(make_input(100, "the quick brown fox jumps"));
+        let tokens_after_rev1: Vec<String> =
+            article.tokens.iter().map(|w| w.value.clone()).collect();
+        assert_eq!(tokens_after_rev1, vec!["the", "quick", "brown", "fox", "jumps"]);
+        let quick_id = find_token(&article, "quick").unwrap();
+
+        article.analyse_revision(make_input(101, "the slow brown fox jumps"));
+
+        // "the", "brown", "fox", "jumps" reused; "slow" allocated fresh.
+        let slow_id = find_token(&article, "slow").unwrap();
+        assert_eq!(article.tokens.len(), 6);
+        assert_eq!(article.tokens[slow_id].origin_rev_id, 101);
+        assert_eq!(article.tokens[slow_id].last_rev_id, 101);
+
+        // "quick" was deleted — outbound has rev 101.
+        assert_eq!(article.tokens[quick_id].outbound, vec![101]);
+        // "quick" was NOT matched in rev 101, so last_rev_id stays at 100.
+        assert_eq!(article.tokens[quick_id].last_rev_id, 100);
+
+        // Kept tokens get last_rev_id bumped to 101 but no inbound
+        // (they existed in revision_prev = 100).
+        for value in ["the", "brown", "fox", "jumps"] {
+            let tid = find_token(&article, value).unwrap();
+            assert_eq!(article.tokens[tid].last_rev_id, 101, "{value}");
+            assert!(article.tokens[tid].inbound.is_empty(), "{value}");
+        }
+
+        // The current revision's sentence wires up all 5 of its words.
+        let curr = article.revisions.get(&101).unwrap();
+        let curr_para = curr.paragraphs.values().next().unwrap()[0];
+        let curr_sent = article.paragraph(curr_para).sentences.values().next().unwrap()[0];
+        let curr_words: Vec<&str> = article
+            .sentence(curr_sent)
+            .words
+            .iter()
+            .map(|wid| article.tokens[*wid as usize].value.as_str())
+            .collect();
+        assert_eq!(curr_words, vec!["the", "slow", "brown", "fox", "jumps"]);
+    }
+
+    #[test]
+    fn analyse_revision_deleted_token_records_outbound() {
+        // Pure token deletion: shorten "alpha beta gamma" to "alpha
+        // gamma". `beta` should land in outbound for rev 101.
+        let mut article = Article::new("Test");
+        article.analyse_revision(make_input(100, "alpha beta gamma delta"));
+        let beta_id = find_token(&article, "beta").unwrap();
+
+        article.analyse_revision(make_input(101, "alpha gamma delta"));
+
+        assert_eq!(article.tokens[beta_id].outbound, vec![101]);
+        // No new token allocated (delete-only).
+        assert_eq!(article.tokens.len(), 4);
+        // Other tokens have no outbound and bumped last_rev_id.
+        for value in ["alpha", "gamma", "delta"] {
+            let tid = find_token(&article, value).unwrap();
+            assert!(article.tokens[tid].outbound.is_empty(), "{value}");
+            assert_eq!(article.tokens[tid].last_rev_id, 101, "{value}");
+        }
+    }
+
+    #[test]
+    fn analyse_revision_inserted_tokens_within_existing_sentence() {
+        // Pure insertion within a sentence: add "very fast" inside
+        // "the fox" to produce "the very fast fox". Reuses "the" and
+        // "fox", allocates "very" and "fast".
+        let mut article = Article::new("Test");
+        article.analyse_revision(make_input(100, "the fox runs daily"));
+        let the_id = find_token(&article, "the").unwrap();
+        let fox_id = find_token(&article, "fox").unwrap();
+
+        article.analyse_revision(make_input(101, "the very fast fox runs daily"));
+
+        // 4 + 2 new tokens.
+        assert_eq!(article.tokens.len(), 6);
+        let very_id = find_token(&article, "very").unwrap();
+        let fast_id = find_token(&article, "fast").unwrap();
+        assert_eq!(article.tokens[very_id].origin_rev_id, 101);
+        assert_eq!(article.tokens[fast_id].origin_rev_id, 101);
+
+        // Reused tokens: last_rev_id bumped, inbound still empty.
+        for id in [the_id, fox_id] {
+            assert_eq!(article.tokens[id].last_rev_id, 101);
+            assert!(article.tokens[id].inbound.is_empty());
+            assert!(article.tokens[id].outbound.is_empty());
+        }
+    }
+
+    #[test]
+    fn analyse_revision_reintroduced_sentence_records_inbound() {
+        // Rev 100: two paragraphs. Rev 101: drop the second paragraph
+        // (its words go outbound). Rev 102: re-add the second
+        // paragraph (sentences_ht catches it, words get inbound).
+        let mut article = Article::new("Test");
+        let p1 = "first paragraph stays put.";
+        let p2 = "second paragraph comes and goes.";
+        article.analyse_revision(make_input(100, &format!("{p1}\n\n{p2}")));
+        let comes_id = find_token(&article, "comes").unwrap();
+        assert_eq!(article.tokens[comes_id].origin_rev_id, 100);
+        assert_eq!(article.tokens[comes_id].last_rev_id, 100);
+
+        // Rev 101: just p1. p2's sentence becomes unmatched_prev. Its
+        // words should get outbound[-1] = 101.
+        // Use a non-empty comment to bypass length-shrink.
+        let mut input = make_input(101, p1);
+        input.comment = Some("trimming".into());
+        article.analyse_revision(input);
+        assert_eq!(article.tokens[comes_id].outbound, vec![101]);
+        // last_rev_id stays at 100 (the word wasn't matched in rev 101).
+        assert_eq!(article.tokens[comes_id].last_rev_id, 100);
+
+        // Rev 102: bring p2 back. sentences_ht / paragraphs_ht should
+        // catch the reuse — same token id, inbound bumped.
+        article.analyse_revision(make_input(102, &format!("{p1}\n\n{p2}")));
+
+        // Confirm we did NOT allocate new tokens for p2's words.
+        // The expected arena size: 4 (p1) + 5 (p2: second, paragraph,
+        // comes, and, goes) + 1 (.) per paragraph + 1 final "." = let
+        // me just count vs the rev-100 size.
+        // Easier: token "comes" id should be unchanged, and inbound
+        // should now include 102.
+        let comes_id_after = find_token(&article, "comes").unwrap();
+        assert_eq!(comes_id_after, comes_id, "same token reused");
+        assert_eq!(article.tokens[comes_id].inbound, vec![102]);
+        assert_eq!(article.tokens[comes_id].outbound, vec![101]);
+        assert_eq!(article.tokens[comes_id].last_rev_id, 102);
+    }
+
+    #[test]
+    fn analyse_revision_reintroduced_token_via_diff_records_inbound() {
+        // The trickier path: a TOKEN that disappears and comes back,
+        // not via sentence-level reuse but via the Myers diff. This
+        // exercises the "Keep-via-Myers and inbound bump because
+        // last_rev_id != revision_prev.id" path.
+        let mut article = Article::new("Test");
+        // Rev 100: contains "wolf".
+        article.analyse_revision(make_input(100, "the wolf howls."));
+        let wolf_id = find_token(&article, "wolf").unwrap();
+
+        // Rev 101: drop "wolf", different sentence. Outbound bumps wolf.
+        // Use a non-trivial comment so length-shrink doesn't trip.
+        let mut input = make_input(101, "the cat sleeps.");
+        input.comment = Some("rewrite".into());
+        article.analyse_revision(input);
+        assert_eq!(article.tokens[wolf_id].outbound, vec![101]);
+        assert_eq!(article.tokens[wolf_id].last_rev_id, 100);
+
+        // Rev 102: re-add "wolf" inside a new sentence. The paragraph
+        // hash doesn't match anything (different surrounding text);
+        // sentences_ht doesn't have this exact sentence either; token
+        // cascade runs Myers, which sees "wolf" available in text_prev
+        // (from the rev-101 sentence... wait, no — rev 101's
+        // text_prev_for_us would be revs ≤101's contents). Let me
+        // think again.
+        //
+        // Actually for rev 102, revision_prev = rev 101 (last good).
+        // text_prev for the cascade is built from rev 101's unmatched
+        // sentences. "the cat sleeps." is in rev 101. If rev 102 is
+        // "the wolf howls again.", then rev 101's sentence becomes
+        // unmatched_sentences_prev. text_prev = ["the","cat","sleeps","."].
+        // text_curr = ["the","wolf","howls","again","."].
+        // Myers: keep "the", delete "cat" insert "wolf", delete
+        // "sleeps" insert "howls", insert "again", keep ".".
+        // The "wolf" in text_curr is a fresh insert per Myers.
+        //
+        // But the FALLBACK in the cascade allocates new when the curr
+        // word isn't matched in the diff. So "wolf" gets a NEW token
+        // id, NOT reusing the rev-100 "wolf". That's the right
+        // algorithm behavior — Myers doesn't know about rev-100's
+        // dropped word.
+        //
+        // So this test demonstrates that single-token reintroduction
+        // through the diff path does NOT find the old token; the
+        // hash-table reuse (sentences_ht / paragraphs_ht) is the only
+        // mechanism that preserves long-distance identity. Without
+        // sentence-level reuse, "wolf" gets a new id.
+        article.analyse_revision(make_input(102, "the wolf howls again."));
+
+        // Confirm a NEW wolf token was allocated (not reusing the old).
+        let wolf_ids: Vec<usize> = article
+            .tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.value == "wolf")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(wolf_ids.len(), 2, "two distinct wolf tokens");
+        // The new wolf is origin = 102.
+        let new_wolf = wolf_ids.iter().find(|&&i| i != wolf_id).copied().unwrap();
+        assert_eq!(article.tokens[new_wolf].origin_rev_id, 102);
+        // The old wolf still has its outbound from rev 101 only.
+        assert_eq!(article.tokens[wolf_id].outbound, vec![101]);
+        assert!(article.tokens[wolf_id].inbound.is_empty());
+    }
+
+    #[test]
+    fn analyse_revision_three_revisions_chain_inbound_outbound_consistently() {
+        // Validate that consecutive revisions keep token bookkeeping
+        // consistent. Pattern: word "shared" stays across all three
+        // revisions and should never accumulate inbound/outbound.
+        // Word "extra" appears in rev 1, not in rev 2, then again in
+        // rev 3 via sentence-level reuse → outbound=[2], inbound=[3].
+        let mut article = Article::new("Test");
+        article.analyse_revision(make_input(100, "shared text remains.\n\nextra paragraph here."));
+        let shared_id = find_token(&article, "shared").unwrap();
+        let extra_id = find_token(&article, "extra").unwrap();
+
+        let mut input = make_input(101, "shared text remains.");
+        input.comment = Some("trimming".into());
+        article.analyse_revision(input);
+
+        article.analyse_revision(make_input(102, "shared text remains.\n\nextra paragraph here."));
+
+        // shared never disappeared — clean history.
+        assert!(article.tokens[shared_id].inbound.is_empty());
+        assert!(article.tokens[shared_id].outbound.is_empty());
+        assert_eq!(article.tokens[shared_id].last_rev_id, 102);
+
+        // extra: out in 101, back in 102.
+        assert_eq!(article.tokens[extra_id].outbound, vec![101]);
+        assert_eq!(article.tokens[extra_id].inbound, vec![102]);
+        assert_eq!(article.tokens[extra_id].last_rev_id, 102);
     }
 }

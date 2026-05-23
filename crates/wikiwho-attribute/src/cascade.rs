@@ -27,6 +27,7 @@
 //! scratchpad instead — when it falls out of scope the "reset" is
 //! automatic.
 
+use crate::diff;
 use crate::spam::{TOKEN_DENSITY_LIMIT, UNMATCHED_PARAGRAPH};
 use crate::structures::{Article, Hash, MatchedSets, ParagraphId, Revision, SentenceId, TokenId};
 use crate::tokenize::{avg_word_freq, hash_md5, split_paragraphs, split_sentences, split_tokens};
@@ -59,8 +60,8 @@ pub struct SentenceAnalysis {
 }
 
 /// Aggregated cascade output. `determine_authorship` returns this so
-/// callers can later walk the matched/unmatched sets for inbound /
-/// outbound recording (not implemented yet).
+/// callers can walk the matched/unmatched sets for the post-cascade
+/// inbound/outbound recorder (`Article::record_inbound_outbound`).
 #[derive(Debug, Default)]
 pub struct CascadeOutput {
     pub matched_paragraphs_prev: Vec<ParagraphId>,
@@ -70,6 +71,13 @@ pub struct CascadeOutput {
     pub matched_words_prev: Vec<TokenId>,
     pub unmatched_paragraphs_curr: Vec<ParagraphId>,
     pub unmatched_sentences_curr: Vec<SentenceId>,
+    /// The set of token IDs that were matched somewhere in the cascade
+    /// (paragraph, sentence, or word level). Equivalent to the Python's
+    /// `word_prev.matched == True` predicate after the cascade
+    /// completes; the recorder consults this when deciding whether a
+    /// prev sentence's words went "outbound" or stayed in the matched
+    /// tracker.
+    pub matched_token_ids: std::collections::HashSet<TokenId>,
     /// True if the token-density vandalism gate fired
     /// (`wikiwho.py:608-611`). The caller rolls back when this is set.
     pub vandalism: bool,
@@ -99,6 +107,11 @@ pub fn determine_authorship(
     out.matched_paragraphs_prev = pa.matched_paragraphs_prev;
 
     if out.unmatched_paragraphs_curr.is_empty() {
+        // Every curr paragraph matched at the paragraph level — no
+        // sentence or token cascade work to do, but we still need to
+        // surface the matched token ids the recorder will use to bump
+        // inbound/last_rev_id on paragraph-matched words.
+        out.matched_token_ids = matched.tokens;
         return out;
     }
 
@@ -135,6 +148,11 @@ pub fn determine_authorship(
         out.vandalism = vandalism;
     }
 
+    // Capture the cascade's matched-token set before it falls out of
+    // scope. The recorder needs it to distinguish words that survived
+    // the cascade (kept, get inbound/last_rev_id bumps) from words
+    // that didn't (outbound).
+    out.matched_token_ids = matched.tokens;
     out
 }
 
@@ -372,14 +390,20 @@ pub fn analyse_sentences_in_paragraphs(
     analysis
 }
 
-/// Token level. Port of `wikiwho.py:584-691`.
+/// Token level. Full port of `wikiwho.py:584-691`.
 ///
-/// **Partial port:** the insertion-only path (text_prev empty, all
-/// tokens are fresh) and the deletion-only short-circuit are fully
-/// implemented. The general case (`difflib.Differ` over text_prev ×
-/// text_curr, to be replaced by Myers per `ALGORITHM.md §6`) is queued
-/// for next session and will currently panic via `todo!()`. Single-rev
-/// processing never reaches that path; multi-rev does.
+/// Three paths:
+/// 1. **Deletion-only** (`text_curr` empty): nothing to match, return
+///    early. Outbound recording lives in the post-cascade recorder.
+/// 2. **Insertion-only** (`text_prev` empty): every curr token is
+///    fresh — allocate them all in document order.
+/// 3. **General case**: run Myers diff over interned `&[u32]` token
+///    ids, then walk the curr sentences consuming the transcript per
+///    `wikiwho.py:631-691`. The DELETE-branch quirk (where a curr
+///    token's value coincides with a deleted prev token's value, so we
+///    consume the prev word AND keep scanning the diff for the curr
+///    word) is ported verbatim — it's load-bearing per
+///    `ALGORITHM.md §4.3`.
 pub fn analyse_words_in_sentences(
     article: &mut Article,
     unmatched_sentences_curr: &[SentenceId],
@@ -388,16 +412,22 @@ pub fn analyse_words_in_sentences(
     revision_curr: &mut Revision,
     matched: &mut MatchedSets,
 ) -> (Vec<TokenId>, bool) {
-    let matched_words_prev: Vec<TokenId> = Vec::new();
+    let mut matched_words_prev: Vec<TokenId> = Vec::new();
 
-    // Build text_prev: every still-unmatched word in the unmatched
-    // previous-revision sentences (wikiwho.py:589-594).
+    // Parallel arrays for the unmatched prev words: `unmatched_words_prev`
+    // holds the TokenId, `text_prev` holds the value (a cloned string,
+    // since the `Word::value` is also stored in `article` which we'll
+    // be mutating later). The two are indexed in lockstep and the
+    // "matched" status is read from `matched.tokens` — the Python's
+    // `word_prev.matched` flag.
+    let mut unmatched_words_prev: Vec<TokenId> = Vec::new();
     let mut text_prev: Vec<String> = Vec::new();
     for &sid in unmatched_sentences_prev {
         let sentence = article.sentence(sid);
         for &wid in &sentence.words {
             if !matched.tokens.contains(&wid) {
                 text_prev.push(article.word(wid).value.clone());
+                unmatched_words_prev.push(wid);
             }
         }
     }
@@ -447,14 +477,137 @@ pub fn analyse_words_in_sentences(
         return (matched_words_prev, possible_vandalism);
     }
 
-    // General case: requires Myers diff. Queued for next session;
-    // single-rev tests never reach here.
-    todo!(
-        "Myers diff for multi-revision token cascade — see ALGORITHM.md §6. \
-         text_prev.len()={} text_curr.len()={}",
-        text_prev.len(),
-        text_curr.len()
-    );
+    // General case: Myers diff (wikiwho.py:631-691). See ALGORITHM.md §6.
+    let (a_ids, b_ids, values) = diff::intern_sequences(&text_prev, &text_curr);
+    let ops = diff::myers_diff(&a_ids, &b_ids);
+
+    // The matching loop consults the transcript by looking up entries
+    // by their token VALUE (matching the Python `if word == word_diff[2:]`).
+    // We need a mutable working copy so we can mark entries consumed.
+    let mut diff_entries: Vec<DiffEntry> = ops
+        .iter()
+        .map(|op| {
+            let (kind, value_id) = match *op {
+                diff::DiffOp::Keep(v) => (DiffKind::Keep, v),
+                diff::DiffOp::Delete(v) => (DiffKind::Delete, v),
+                diff::DiffOp::Insert(v) => (DiffKind::Insert, v),
+            };
+            DiffEntry {
+                kind,
+                value: values[value_id as usize].clone(),
+                consumed: false,
+            }
+        })
+        .collect();
+
+    for (sid, words) in sentence_words {
+        for word in words {
+            let mut curr_matched = false;
+
+            // Walk the diff looking for an entry whose value equals
+            // `word` (and isn't already consumed). The first such entry
+            // determines what we do — keep / delete / insert — exactly
+            // mirroring the Python `while pos < diff_len` loop. The
+            // delete branch keeps scanning (Python comment: "but don't
+            // set curr_matched"); the keep/insert branches exit the
+            // scan immediately.
+            let mut pos = 0;
+            while pos < diff_entries.len() {
+                let entry = &diff_entries[pos];
+                if !entry.consumed && entry.value == word {
+                    match entry.kind {
+                        DiffKind::Keep => {
+                            if let Some(prev_idx) = find_unmatched_prev(
+                                &unmatched_words_prev,
+                                &text_prev,
+                                &word,
+                                matched,
+                            ) {
+                                let wid_prev = unmatched_words_prev[prev_idx];
+                                matched.tokens.insert(wid_prev);
+                                curr_matched = true;
+                                article.sentence_mut(sid).words.push(wid_prev);
+                                matched_words_prev.push(wid_prev);
+                                diff_entries[pos].consumed = true;
+                                break;
+                            }
+                        }
+                        DiffKind::Delete => {
+                            if let Some(prev_idx) = find_unmatched_prev(
+                                &unmatched_words_prev,
+                                &text_prev,
+                                &word,
+                                matched,
+                            ) {
+                                let wid_prev = unmatched_words_prev[prev_idx];
+                                matched.tokens.insert(wid_prev);
+                                article.word_mut(wid_prev).outbound.push(revision_curr.id);
+                                matched_words_prev.push(wid_prev);
+                                diff_entries[pos].consumed = true;
+                                // Do NOT set curr_matched — the curr
+                                // word still needs to be matched (or
+                                // allocated fresh). The Python's `break`
+                                // here only exits the inner `for
+                                // word_prev` loop, not the diff scan.
+                            }
+                        }
+                        DiffKind::Insert => {
+                            curr_matched = true;
+                            let wid = article.alloc_word(word.clone(), revision_curr.id);
+                            article.sentence_mut(sid).words.push(wid);
+                            revision_curr.original_adds += 1;
+                            diff_entries[pos].consumed = true;
+                            break;
+                        }
+                    }
+                }
+                pos += 1;
+            }
+
+            // Fallback (wikiwho.py:679-689): no diff entry matched →
+            // allocate fresh. This catches duplicate curr tokens past
+            // the first occurrence, which the diff only listed once.
+            if !curr_matched {
+                let wid = article.alloc_word(word, revision_curr.id);
+                article.sentence_mut(sid).words.push(wid);
+                revision_curr.original_adds += 1;
+            }
+        }
+    }
+
+    (matched_words_prev, possible_vandalism)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DiffKind {
+    Keep,
+    Delete,
+    Insert,
+}
+
+#[derive(Debug, Clone)]
+struct DiffEntry {
+    kind: DiffKind,
+    value: String,
+    consumed: bool,
+}
+
+/// Find the first index in `unmatched_words_prev` whose value equals
+/// `word` and which is not yet in `matched.tokens`. Returns `None` if
+/// no such word exists. Mirrors the Python inner loop
+/// `for word_prev in unmatched_words_prev: if not word_prev.matched and
+/// word_prev.value == word`.
+fn find_unmatched_prev(
+    unmatched_words_prev: &[TokenId],
+    text_prev: &[String],
+    word: &str,
+    matched: &MatchedSets,
+) -> Option<usize> {
+    unmatched_words_prev
+        .iter()
+        .enumerate()
+        .find(|(i, wid)| !matched.tokens.contains(wid) && text_prev[*i] == word)
+        .map(|(i, _)| i)
 }
 
 // ---- helpers ----
@@ -557,6 +710,145 @@ fn add_paragraph_to_revision(revision_curr: &mut Revision, hash: &Hash, pid: Par
         .or_default()
         .push(pid);
     revision_curr.ordered_paragraphs.push(hash.clone());
+}
+
+/// Post-cascade recorder. Walks the matched/unmatched sets returned by
+/// `determine_authorship` to bump `outbound` on deleted words and
+/// `inbound` / `last_rev_id` on words that survived (full port of
+/// `wikiwho.py:257-305`).
+///
+/// Two important quirks of the reference are preserved verbatim:
+///
+/// - The `if not unmatched_sentences_prev:` second outbound pass at
+///   `wikiwho.py:263-270` only fires when sentence-cascade didn't
+///   produce any unmatched-prev sentences (which is exactly the
+///   "all curr paragraphs matched" case, since the tail loop in
+///   `analyse_sentences_in_paragraphs` always populates the list when
+///   sentence-cascade does run on unmatched_paragraphs_prev). It
+///   catches the words inside paragraphs the sentence cascade never
+///   visited.
+/// - The Python `for matched_word in matched_words_prev` loop at
+///   :298-305 references a stale `word_prev` variable from the prior
+///   `matched_sentences_prev` loop — this is a latent Python bug.
+///   For diff-matched Keep-branch words, the inbound/last_rev_id
+///   update is already performed via `matched_sentences_prev`
+///   (because the tail loop in `analyse_sentences_in_paragraphs`
+///   places those sentences in both unmatched AND matched lists).
+///   For Delete-branch words the outbound update happened in the
+///   cascade itself. Our port skips the buggy loop entirely; the
+///   functional behaviour matches.
+pub fn record_inbound_outbound(
+    article: &mut Article,
+    out: &CascadeOutput,
+    revision_prev_id: crate::structures::RevId,
+    revision_curr_id: crate::structures::RevId,
+) {
+    if out.vandalism {
+        return;
+    }
+
+    // --- Outbound recording (wikiwho.py:257-270) ---
+    //
+    // Every word in an unmatched-prev sentence that didn't survive
+    // anywhere in the cascade is being deleted in this revision; mark
+    // it.
+    for &sid in &out.unmatched_sentences_prev {
+        // Clone the words list to release the immutable borrow on
+        // article before we start mutating words.
+        let words: Vec<TokenId> = article.sentence(sid).words.clone();
+        for wid in words {
+            if !out.matched_token_ids.contains(&wid) {
+                article.word_mut(wid).outbound.push(revision_curr_id);
+            }
+        }
+    }
+
+    // The "if no sentence-level pass ran" case: walk unmatched prev
+    // paragraphs and capture outbound for any unmatched words.
+    if out.unmatched_sentences_prev.is_empty() {
+        for &pid in &out.unmatched_paragraphs_prev {
+            let sentence_ids: Vec<SentenceId> = article
+                .paragraph(pid)
+                .sentences
+                .values()
+                .flat_map(|bucket| bucket.iter().copied())
+                .collect();
+            for sid in sentence_ids {
+                let words: Vec<TokenId> = article.sentence(sid).words.clone();
+                for wid in words {
+                    if !out.matched_token_ids.contains(&wid) {
+                        article.word_mut(wid).outbound.push(revision_curr_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Inbound / last_rev_id recording (wikiwho.py:272-297) ---
+    //
+    // For paragraph-level full-matches: every word inherits a touch.
+    // For sentence-level matches (including the tail-loop additions
+    // that overlap unmatched_sentences_prev), iterate words and
+    // update only those that survived AND weren't deleted in this rev.
+
+    for &pid in &out.matched_paragraphs_prev {
+        let sentence_ids: Vec<SentenceId> = article
+            .paragraph(pid)
+            .sentences
+            .values()
+            .flat_map(|bucket| bucket.iter().copied())
+            .collect();
+        for sid in sentence_ids {
+            let words: Vec<TokenId> = article.sentence(sid).words.clone();
+            for wid in words {
+                update_inbound_and_last_rev_id(
+                    article,
+                    wid,
+                    &out.matched_token_ids,
+                    revision_prev_id,
+                    revision_curr_id,
+                );
+            }
+        }
+    }
+
+    for &sid in &out.matched_sentences_prev {
+        let words: Vec<TokenId> = article.sentence(sid).words.clone();
+        for wid in words {
+            update_inbound_and_last_rev_id(
+                article,
+                wid,
+                &out.matched_token_ids,
+                revision_prev_id,
+                revision_curr_id,
+            );
+        }
+    }
+}
+
+/// Apply the `wikiwho.py:280-284` update rule to a single word.
+fn update_inbound_and_last_rev_id(
+    article: &mut Article,
+    wid: TokenId,
+    matched_token_ids: &std::collections::HashSet<TokenId>,
+    revision_prev_id: crate::structures::RevId,
+    revision_curr_id: crate::structures::RevId,
+) {
+    if !matched_token_ids.contains(&wid) {
+        return;
+    }
+    let word = article.word_mut(wid);
+    // Skip if outbound already includes revision_curr_id — that means
+    // the diff loop already flagged this word as deleted in THIS rev
+    // (the elif '-' branch). The Python check is identical:
+    //   if not word_prev.outbound or word_prev.outbound[-1] != self.revision_curr.id
+    if word.outbound.last() == Some(&revision_curr_id) {
+        return;
+    }
+    if word.last_rev_id != revision_prev_id {
+        word.inbound.push(revision_curr_id);
+    }
+    word.last_rev_id = revision_curr_id;
 }
 
 #[cfg(test)]

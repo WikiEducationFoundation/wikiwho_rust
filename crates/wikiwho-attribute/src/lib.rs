@@ -13,15 +13,20 @@
 //! - `structures` — data types (`Word`, `Sentence`, `Paragraph`,
 //!   `Revision`, `Article`) using arena-allocated indices instead of
 //!   shared references; no `matched` flag on nodes (per-iteration
-//!   `MatchedSets` will replace it).
+//!   `MatchedSets` replaces it).
 //! - `spam` — constants + length-shrink + hash-match vandalism
 //!   checks. The token-density check is wired in by `cascade`.
-//! - `cascade` — paragraph + sentence + (insertion-only) token
-//!   levels and the `determine_authorship` orchestrator. The general
-//!   token-cascade case (Differ→Myers diff) is queued for the next
-//!   session.
+//! - `diff` — Myers diff over interned `&[u32]` token id sequences.
+//!   Replaces Python `difflib.Differ` in the general token cascade.
+//! - `cascade` — full paragraph + sentence + token cascade, including
+//!   the Myers-driven general-case token diff and the post-cascade
+//!   inbound/outbound recorder. `determine_authorship` is the
+//!   orchestrator.
+//! - `pipeline` — `Article::analyse_revision` wires the per-revision
+//!   spam checks, cascade, and recorder into a single entry point.
 
 pub mod cascade;
+pub mod diff;
 pub mod pipeline;
 pub mod spam;
 pub mod structures;
