@@ -1,0 +1,32 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Python helper-script artifacts
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local Claude settings (per-machine, not shared)
+.claude/settings.local.json
+.claude/projects/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Captured Wikipedia data — large, regeneratable; not committed.
+# Each entry is the live response from production wikiwho-api at capture
+# time, so regenerating is a script invocation. Keep them out of git
+# until/unless we want a frozen fixture set.
+/parity-fixtures/
+
+# Build / cache artifacts from any future scripts
+/tmp/
+/.cache/
