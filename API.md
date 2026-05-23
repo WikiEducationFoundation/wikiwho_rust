@@ -370,9 +370,11 @@ Override via query parameter:
 
 #### Response envelope additions
 
-When the ephemeral path is taken (any `ns ≠ 0`, or any explicit
-`window=N` query), the response envelope carries two extra fields
-alongside the existing shape from (1)–(6):
+To keep strict byte-for-byte parity with current production on
+mainspace endpoints, the four ephemeral-mode fields are **only present
+when the response was built from an on-demand replay** (`ns ≠ 0`, or an
+explicit `window=N` query). Mainspace storage-backed responses are
+unchanged from (1)–(6).
 
 ```json
 {
@@ -388,12 +390,11 @@ alongside the existing shape from (1)–(6):
 }
 ```
 
-- `namespace` — the MW namespace number (0 = mainspace, 1 = Talk,
-  2 = User, etc.). Mainspace responses also include this for
-  consistency.
-- `ephemeral` — `true` when the response was built from an on-demand
-  replay rather than durable storage. Always `false` for mainspace
-  responses backed by storage.
+- `namespace` — the MW namespace number (1 = Talk, 2 = User, etc.).
+  Absent on mainspace responses (consumers already know it's ns 0
+  from the URL they sent).
+- `ephemeral` — always `true` when present. Absent on mainspace
+  responses, which means the same thing as `false` would.
 - `window_start_rev_id` — the first rev id the algorithm saw, or
   `null` for `window=full`. Consumers interpret `o_rev_id ==
   window_start_rev_id` to mean "token was already present at the
@@ -405,7 +406,8 @@ Tokens carrying `o_rev_id == window_start_rev_id` are NOT semantically
 the same as tokens introduced *in* `window_start_rev_id` in mainspace;
 they may have been introduced much earlier. Consumers that highlight
 "new tokens" should treat them as "unknown origin" rather than
-attributing to that revision.
+attributing to that revision. The presence of the `ephemeral` field is
+the signal that this reinterpretation applies.
 
 #### Caching semantics
 
