@@ -20,6 +20,71 @@ Format:
 
 ---
 
+## 2026-05-23 — how to persist paragraph + sentence arenas for resume-from-disk [non-blocking]
+
+**Context:** This session landed `wikiwho-storage`'s read-side (strings,
+tokens, revisions, hashtables, meta) and verified byte-identical
+round-trip of the wire-format response on 5 captured fixtures including
+en/Photosynthesis (5495 revs). The **write-side for live updates is
+incomplete**: after a fresh ingest, applying a new revision needs the
+algorithm to resume from disk with full state, but our `revisions.bin`
+does NOT persist paragraph or sentence arenas (we store the resolved
+token sequence per revision instead — cheaper for the read path).
+STORAGE.md §4 contemplated hashtables.bin pointing into revisions.bin
+via `(rev_id, position)` tuples, which presumes paragraphs/sentences
+*are* in revisions.bin. They aren't.
+
+So we need to decide *where* and *how* to persist the paragraph /
+sentence state needed for `Article.paragraphs_ht`, `Article.sentences_ht`,
+the per-revision `revision.paragraphs` + `revision.ordered_paragraphs`,
+and the `Article.paragraphs` + `Article.sentences` arenas. Without
+this, "Strategy B wholesale rewrite" can't actually rewrite — the
+algorithm's working state isn't fully serialized.
+
+**Options:**
+
+- **A. Inline into revisions.bin.** Per revision, store
+  `paragraphs[]` where each paragraph is `(hash, [sentence-of-(hash,
+  [token_id, ...])])`. Token-sequence-per-revision derivable by
+  concat-walking. `hashtables.bin` then points into revisions.bin
+  by `(rev_id, paragraph_index)`. Pros: one file per article for
+  per-rev state; spec aligns with STORAGE.md §4's original framing.
+  Cons: revisions.bin grows ~3-5× (every paragraph hash gets stored
+  per rev that contains it, not deduplicated); the read path slows
+  because to get a token sequence you now walk paragraphs anyway.
+- **B. Separate `paragraphs.bin` + `sentences.bin` arena files,
+  mirroring `tokens.bin`.** Each paragraph stored once by arena id
+  with `(hash, [sentence_arena_id, ...])`. Each revision references
+  paragraph arena ids in document order. `hashtables.bin` maps
+  `hash → [paragraph_arena_id]`. Pros: maximum dedup — a paragraph
+  introduced once and unchanged across 1000 revs is stored once;
+  the read path keeps the cheap "stored token sequence per rev"
+  shortcut already implemented. Cons: 5 binary files per article,
+  a bit more bookkeeping; the writer's first pass has to learn the
+  full arena layout before writing.
+- **C. Skip persistence of paragraph/sentence state entirely. Only
+  support cold rebuild from the full revision history.** When a new
+  revision arrives, read history.jsonl (or fetch all revisions
+  again), replay everything from scratch, re-stitch state in memory,
+  then rewrite all files. Pros: storage layer stays simple; only 4
+  files. Cons: catastrophic on update latency for Obama-class
+  articles — 50k revs × 5.5 ms = 275 s per single-rev update. Plus
+  it requires storing or re-fetching the full revision text history
+  somewhere, which isn't part of the current storage format either.
+
+**Recommendation:** **B.** Mirrors the existing token arena pattern;
+storage-side complexity is bounded; lets the read path stay cheap.
+The on-disk numbers calibrate cleanly against the STORAGE.md §5
+budget (paragraphs and sentences are mostly hash + list-of-ids;
+should be ~5-10 % of per-article bytes on top of tokens).
+
+Worth surfacing now because it sets the shape of the next storage
+crate session — it determines whether the writer learns to emit
+`paragraphs.bin` / `sentences.bin` (B), embed everything in
+revisions.bin (A), or punt entirely (C).
+
+---
+
 ## 2026-05-23 — parity-corpus: large prod-cache divergence on en/COVID-19 and ja/日本 (python ground truth at 100 %) [non-blocking]
 
 **Context:** Captured two new full-history fixtures, ran them through
