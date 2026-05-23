@@ -12,6 +12,7 @@
 //! also accepts both `v1.0.0` and `v1.0.0-beta` as version-segment
 //! aliases per API.md §"Versioning".
 
+pub mod cache_miss;
 pub mod error;
 pub mod handlers;
 pub mod index;

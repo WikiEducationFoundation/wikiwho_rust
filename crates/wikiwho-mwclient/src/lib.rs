@@ -23,8 +23,10 @@ use std::time::Duration;
 
 use reqwest::Client;
 
+pub mod info;
 pub mod revisions;
 
+pub use info::{PageInfo, parse_page_info};
 pub use revisions::{Batch, Revision, RevisionFetcher};
 
 /// Default User-Agent string. Wikimedia policy requires a contact
@@ -116,6 +118,43 @@ impl MwClient {
     /// until it returns `None`.
     pub fn fetch_revisions(&self, page_id: u64, end_rev_id: u64) -> RevisionFetcher<'_> {
         RevisionFetcher::new(self, page_id, end_rev_id, None)
+    }
+
+    /// Resolve a title to a [`PageInfo`] via the Action API
+    /// `prop=info&inprop=lastrevid`. MW handles case normalization and
+    /// redirect resolution server-side; the returned `title` is the
+    /// canonical form MW echoes back, so on-disk storage stays
+    /// consistent with the API.
+    pub async fn resolve_title(&self, title: &str) -> Result<PageInfo> {
+        let body = self
+            .request_json(&[
+                ("action", "query"),
+                ("format", "json"),
+                ("formatversion", "2"),
+                ("prop", "info"),
+                ("inprop", "lastrevid"),
+                ("titles", title),
+            ])
+            .await?;
+        parse_page_info(&body)
+    }
+
+    /// Resolve a `page_id` to a [`PageInfo`] via the Action API. Used
+    /// by the page_id endpoints' cache-miss path to learn the latest
+    /// rev_id (and the stored title) without an extra round-trip.
+    pub async fn resolve_page_id(&self, page_id: u64) -> Result<PageInfo> {
+        let page_id_s = page_id.to_string();
+        let body = self
+            .request_json(&[
+                ("action", "query"),
+                ("format", "json"),
+                ("formatversion", "2"),
+                ("prop", "info"),
+                ("inprop", "lastrevid"),
+                ("pageids", page_id_s.as_str()),
+            ])
+            .await?;
+        parse_page_info(&body)
     }
 
     /// Resume an in-progress fetch from a saved `rvcontinue` token.

@@ -1601,6 +1601,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wikiwho-attribute",
+ "wikiwho-mwclient",
  "wikiwho-storage",
 ]
 

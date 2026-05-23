@@ -10,10 +10,17 @@
 //! Then we call [`wikiwho_attribute::response::build_rev_content`] on
 //! a [`SnapshotReader`]-hydrated `Article` and return the JSON.
 //!
-//! Endpoint 1 (`/rev_content/rev_id/{rev_id}/`) resolves the rev_id to
-//! a page_id via the per-language `rev_id_index.bin` sidecar (loaded
-//! lazily by [`AppState::resolve_rev_id`]), then re-uses the same
-//! page_id path as endpoints 4/6.
+//! **Cache-miss path (PLAN.md §280-287):** for endpoints 2-6, if the
+//! article isn't on disk the handler does a one-shot MW lookup to
+//! learn `(title, page_id, last_revid)`, spawns a background task to
+//! fetch + replay the full history, and returns the
+//! "still processing" envelope (HTTP 408 — API.md §1) immediately.
+//! Subsequent requests for the same article either see the
+//! in-flight slot and 408 again, or — once processing finishes —
+//! serve from disk. Endpoint 1 (rev_id-only) skips the MW lookup;
+//! Impact Visualizer's existing fixture rev_ids are already in
+//! `rev_id_index.bin` (or, if not, the 408 path triggers a client
+//! retry that hits a title- or page_id-keyed endpoint instead).
 
 use axum::{
     Json,
@@ -25,8 +32,10 @@ use serde_json::{Value, json};
 use wikiwho_attribute::response::{
     RevContentError, RevContentResponse, ResponseParameters, build_rev_content,
 };
+use wikiwho_mwclient::{MwClient, MwError};
 use wikiwho_storage::reader::SnapshotReader;
 
+use crate::cache_miss;
 use crate::error::ServerError;
 use crate::params::RawTokenParams;
 use crate::state::AppState;
@@ -69,38 +78,71 @@ pub struct TitleRevPath {
     pub rev_id: u64,
 }
 
+/// Cache-miss seed handed to [`trigger_cache_miss`]. Captures
+/// everything the background task needs to do its work — the
+/// `page_id` it lives under is implicit at the call site.
+#[derive(Debug, Clone)]
+struct CacheMissPlan {
+    title: String,
+    end_rev_id: u64,
+}
+
 /// Endpoint 1: rev_content by rev_id only.
 ///
 /// Resolves the rev_id to a page_id via the per-language
-/// `rev_id_index.bin` sidecar, then delegates to the standard page_id
-/// path with `target_rev_id = Some(rev_id)`. If the index has no entry
-/// for this rev_id we return the "still processing" envelope so the
-/// Impact Visualizer client treats it as "skip this article".
+/// `rev_id_index.bin` sidecar; on hit, delegates to the standard
+/// page_id path. On miss we don't yet have a `rev_id -> page_id` MW
+/// lookup, so we return the 408 envelope.
 pub async fn rev_content_by_rev_id(
     State(state): State<AppState>,
     Path(path): Path<RevIdPath>,
     Query(params): Query<RawTokenParams>,
 ) -> Response {
+    let response_params = params.into_response_parameters();
     let Some(page_id) = state.resolve_rev_id(&path.lang, path.rev_id) else {
         tracing::debug!(
             lang = %path.lang,
             rev_id = path.rev_id,
-            "rev_id not present in rev_id_index.bin"
+            "rev_id not in rev_id_index.bin; cache-miss for rev_id-only is deferred"
         );
         return still_processing();
     };
-    handle_page_id(state, &path.lang, page_id, Some(path.rev_id), params).await
+    serve_or_trigger(
+        state,
+        &path.lang,
+        page_id,
+        Some(path.rev_id),
+        response_params,
+        None,
+    )
+    .await
 }
 
-/// Endpoint 4 + 6: latest revision by page_id (also handles the case
-/// where the route was `rev_content/page_id/.../` — the wire format is
-/// the same).
+/// Endpoint 4 + 6: latest revision by page_id.
+///
+/// On cache miss, asks MW for `(title, last_revid)` and spawns the
+/// background processor.
 pub async fn rev_content_by_page_id(
     State(state): State<AppState>,
     Path(path): Path<PageIdPath>,
     Query(params): Query<RawTokenParams>,
 ) -> Response {
-    handle_page_id(state, &path.lang, path.page_id, None, params).await
+    let response_params = params.into_response_parameters();
+    let page_id = path.page_id;
+
+    // Try on-disk first — cheap when the article is already processed.
+    if let Some(resp) = try_serve_from_disk(&state, &path.lang, page_id, None, response_params) {
+        return resp;
+    }
+
+    // Cache miss: ask MW for the page's metadata so we know what
+    // rev_id to fetch through.
+    let plan = resolve_via_mw(&state, &path.lang, |mw| async move {
+        mw.resolve_page_id(page_id).await
+    })
+    .await
+    .map(|(_pid_from_mw, plan)| plan);
+    cache_miss_response(state, path.lang, page_id, plan)
 }
 
 /// Endpoint 2 + 5: latest revision by title.
@@ -110,64 +152,238 @@ pub async fn rev_content_by_title(
     Query(params): Query<RawTokenParams>,
 ) -> Response {
     let title = normalize_title(&path.title);
-    let Some(page_id) = state.resolve_title(&path.lang, &title) else {
-        return title_not_found(&path.lang, &title);
+    let response_params = params.into_response_parameters();
+
+    if let Some(page_id) = state.resolve_title(&path.lang, &title) {
+        if let Some(resp) = try_serve_from_disk(&state, &path.lang, page_id, None, response_params)
+        {
+            return resp;
+        }
+        // Title in index, file vanished — log + fall through to MW so
+        // we can refetch.
+        tracing::warn!(
+            lang = %path.lang,
+            title = %title,
+            page_id = page_id,
+            "title indexed but article files missing; will refetch"
+        );
+    }
+
+    // Title not in index OR on-disk read failed: ask MW.
+    let plan_with_page_id = resolve_via_mw(&state, &path.lang, |mw| {
+        let title = title.clone();
+        async move { mw.resolve_title(&title).await }
+    })
+    .await;
+
+    let Some((page_id, plan)) = plan_with_page_id else {
+        return still_processing();
     };
-    handle_page_id(state, &path.lang, page_id, None, params).await
+
+    // MW gave us the canonical page_id — try on-disk one more time in
+    // case the article was processed under a different title casing.
+    if let Some(resp) = try_serve_from_disk(&state, &path.lang, page_id, None, response_params) {
+        // Backfill the title index so subsequent requests skip MW.
+        if let Err(e) = state.refresh_title_index(&path.lang) {
+            tracing::warn!(lang = %path.lang, error = %e, "title-index refresh failed");
+        }
+        return resp;
+    }
+    cache_miss_response(state, path.lang, page_id, Some(plan))
 }
 
 /// Endpoint 3: specific rev_id of a specifically-titled article.
 ///
-/// The 5-digit-rev-id heuristic that disambiguates titles-with-slash
-/// from titles-without-slash lives in the route definition (see
-/// `routes.rs`); by the time we get here, the segments are already
-/// split.
+/// On cache miss, the spawned task fetches revisions **through the
+/// requested rev_id**, not the article's current latest.
 pub async fn rev_content_by_title_rev(
     State(state): State<AppState>,
     Path(path): Path<TitleRevPath>,
     Query(params): Query<RawTokenParams>,
 ) -> Response {
     let title = normalize_title(&path.title);
-    let Some(page_id) = state.resolve_title(&path.lang, &title) else {
-        return title_not_found(&path.lang, &title);
+    let response_params = params.into_response_parameters();
+    let target_rev_id = Some(path.rev_id);
+
+    if let Some(page_id) = state.resolve_title(&path.lang, &title) {
+        if let Some(resp) =
+            try_serve_from_disk(&state, &path.lang, page_id, target_rev_id, response_params)
+        {
+            return resp;
+        }
+        tracing::warn!(
+            lang = %path.lang,
+            title = %title,
+            page_id = page_id,
+            "title indexed but article files missing; will refetch"
+        );
+    }
+
+    // Cache miss: resolve title via MW. Use path.rev_id as end_rev_id
+    // (not the article's latest) so the fetched history matches the
+    // requested snapshot.
+    let plan_with_page_id = resolve_via_mw(&state, &path.lang, |mw| {
+        let title = title.clone();
+        async move {
+            let info = mw.resolve_title(&title).await?;
+            Ok(wikiwho_mwclient::PageInfo {
+                title: info.title,
+                page_id: info.page_id,
+                last_revid: path.rev_id,
+            })
+        }
+    })
+    .await;
+
+    let Some((page_id, plan)) = plan_with_page_id else {
+        return still_processing();
     };
-    handle_page_id(state, &path.lang, page_id, Some(path.rev_id), params).await
+    if let Some(resp) =
+        try_serve_from_disk(&state, &path.lang, page_id, target_rev_id, response_params)
+    {
+        if let Err(e) = state.refresh_title_index(&path.lang) {
+            tracing::warn!(lang = %path.lang, error = %e, "title-index refresh failed");
+        }
+        return resp;
+    }
+    cache_miss_response(state, path.lang, page_id, Some(plan))
 }
 
-/// Core handler shared by all variants. `target_rev_id` of `None`
-/// selects the latest processed revision.
-async fn handle_page_id(
+/// Render the article from disk, with the requested rev_id (or
+/// latest if `target_rev_id` is `None`). Returns `None` if the
+/// article isn't on disk so the caller can fall through to a
+/// cache-miss path; returns `Some(error_500)` if the storage layer
+/// surfaced any non-NotFound error.
+fn try_serve_from_disk(
+    state: &AppState,
+    lang: &str,
+    page_id: u64,
+    target_rev_id: Option<u64>,
+    params: ResponseParameters,
+) -> Option<Response> {
+    let reader = match SnapshotReader::open(state.storage_root(), lang, page_id) {
+        Ok(r) => r,
+        Err(wikiwho_storage::StorageError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => {
+            return None;
+        }
+        Err(err) => return Some(error_500(ServerError::from(err))),
+    };
+    let target = match target_rev_id {
+        Some(id) => id,
+        None => reader.article.ordered_revisions.last().copied()?,
+    };
+    Some(render(&reader.article, target, params))
+}
+
+/// "Serve from disk, else trigger cache-miss" for the rev_id-keyed
+/// path that doesn't need an MW resolve step (endpoint 1). Endpoints
+/// 2-6 build their `plan` via [`resolve_via_mw`] and call
+/// [`cache_miss_response`] directly.
+async fn serve_or_trigger(
     state: AppState,
     lang: &str,
     page_id: u64,
     target_rev_id: Option<u64>,
-    params: RawTokenParams,
+    params: ResponseParameters,
+    plan: Option<CacheMissPlan>,
 ) -> Response {
-    let response_params = params.into_response_parameters();
+    if let Some(resp) = try_serve_from_disk(&state, lang, page_id, target_rev_id, params) {
+        return resp;
+    }
+    cache_miss_response(state, lang.to_string(), page_id, plan)
+}
 
-    let reader = match SnapshotReader::open(state.storage_root(), lang, page_id) {
-        Ok(reader) => reader,
-        Err(wikiwho_storage::StorageError::Io(io_err))
-            if io_err.kind() == std::io::ErrorKind::NotFound =>
-        {
-            return still_processing();
-        }
-        Err(err) => {
-            return error_500(ServerError::from(err));
+/// Construct a [`CacheMissPlan`] by asking MW for the article's
+/// `(title, page_id, last_revid)`. Returns `None` for any MW failure
+/// — those map to the 408 envelope at the call site.
+async fn resolve_via_mw<F, Fut>(
+    state: &AppState,
+    language: &str,
+    op: F,
+) -> Option<(u64, CacheMissPlan)>
+where
+    F: FnOnce(std::sync::Arc<MwClient>) -> Fut,
+    Fut: std::future::Future<Output = Result<wikiwho_mwclient::PageInfo, MwError>>,
+{
+    let mw = match state.mw_client(language) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(lang = %language, error = %e, "mw client unavailable");
+            return None;
         }
     };
+    match op(mw).await {
+        Ok(info) => Some((
+            info.page_id,
+            CacheMissPlan {
+                title: info.title,
+                end_rev_id: info.last_revid,
+            },
+        )),
+        Err(MwError::PageMissing { page_id }) => {
+            tracing::debug!(lang = %language, page_id = page_id, "page missing on MW");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(lang = %language, error = %e, "MW lookup failed");
+            None
+        }
+    }
+}
 
-    let target = match target_rev_id {
-        Some(id) => id,
-        None => {
-            let Some(last) = reader.article.ordered_revisions.last().copied() else {
-                return still_processing();
-            };
-            last
+/// Spawn the cache-miss task if we won the in-flight race; either way
+/// return the still-processing envelope. Spawning requires an
+/// `MwClient` (we already have it cached at this point, since
+/// `resolve_via_mw` succeeded).
+fn cache_miss_response(
+    state: AppState,
+    language: String,
+    page_id: u64,
+    plan: Option<CacheMissPlan>,
+) -> Response {
+    if let Some(plan) = plan {
+        trigger_cache_miss(state, language, page_id, plan);
+    }
+    still_processing()
+}
+
+fn trigger_cache_miss(
+    state: AppState,
+    language: String,
+    page_id: u64,
+    plan: CacheMissPlan,
+) {
+    let mw = match state.mw_client(&language) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(lang = %language, error = %e, "mw client unavailable; not spawning");
+            return;
         }
     };
-
-    render(&reader.article, target, response_params)
+    if !state.try_claim_in_flight(&language, page_id) {
+        // Another request beat us to it; the existing task will
+        // process and persist on its own.
+        tracing::debug!(
+            lang = %language,
+            page_id = page_id,
+            "cache-miss already in flight"
+        );
+        return;
+    }
+    let CacheMissPlan { title, end_rev_id } = plan;
+    let fetcher = async move {
+        let fetcher = mw.fetch_revisions(page_id, end_rev_id);
+        cache_miss::collect_all_revisions(fetcher)
+            .await
+            .map_err(Into::into)
+    };
+    tracing::info!(
+        lang = %language,
+        page_id = page_id,
+        end_rev_id = end_rev_id,
+        "spawning cache-miss task"
+    );
+    let _handle = state.spawn_cache_miss(language, title, page_id, fetcher);
 }
 
 /// Render `build_rev_content` output as an HTTP response. Encapsulates
@@ -205,14 +421,6 @@ fn still_processing() -> Response {
         "Info": "Process took more than 240 seconds. Requested data will be available soon (Max 300 seconds). Please try again later."
     });
     (StatusCode::REQUEST_TIMEOUT, Json(body)).into_response()
-}
-
-fn title_not_found(lang: &str, title: &str) -> Response {
-    // Title that isn't on disk maps to the same envelope as
-    // "still processing" — we can't distinguish "not started" from
-    // "in progress" without a stronger ingest signal.
-    tracing::debug!(lang = %lang, title = %title, "title not found in index");
-    still_processing()
 }
 
 fn error_500(err: ServerError) -> Response {
