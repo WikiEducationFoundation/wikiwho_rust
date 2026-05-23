@@ -459,6 +459,16 @@ Two scenarios:
 Either way, comfortably under the 14.7 TB allocated; no storage request
 needed for the rewrite cutover. We have ~2× headroom in the worst case.
 
+**Namespace policy:** these figures cover **mainspace only** (ns 0),
+matching what production stores today. Non-mainspace pages (Talk:,
+User:, Wikipedia:, etc.) are served via the ephemeral path
+(API.md §9) and do **not** consume disk. If a specific non-mainspace
+namespace later moves to durable storage for traffic reasons, its
+size should be added separately to this table — talk pages on
+contentious articles can accumulate 50 000+ revisions and are
+correspondingly heavy, so per-namespace durability is a deliberate
+operational choice rather than a default.
+
 ### 5.5 Where the bytes go (still hand-waved)
 
 Without an in-pickle attribute breakdown we don't yet know what fraction

@@ -316,6 +316,140 @@ applied after exhaustion.
 }
 ```
 
+### 9. Non-mainspace / ephemeral processing
+
+The current production service only stores mainspace (namespace 0)
+articles. The rewrite extends coverage to other namespaces (Talk:,
+User:, User_talk:, Wikipedia:, etc.) via on-demand processing: fetch
+the revision history, run the algorithm, return the response, discard
+the in-memory `Article` (or cache it in a memory-only LRU). Nothing
+hits durable storage.
+
+The trade-off: we don't carry the full revision history for
+high-revision pages, so the algorithm sees only a recent window. For
+talk pages and most non-mainspace content this is fine — the use case
+is "who's contributing to the discussion now," not "who originally
+wrote this token in 2007."
+
+#### Endpoint URLs
+
+Same routes as mainspace, with the namespace-prefixed title:
+
+- `GET /{lang}/api/v1.0.0-beta/rev_content/Talk:Photosynthesis/`
+- `GET /{lang}/api/v1.0.0-beta/rev_content/User:Foo/Sandbox/`
+- `GET /{lang}/whocolor/v1.0.0-beta/Wikipedia:Village_pump/`
+
+No new route schemas. The server determines whether a page is
+mainspace or not by passing the URL-decoded title to the MW Action
+API and using the returned `ns` field. Mainspace (`ns: 0`) goes
+through the durable storage path; everything else goes through the
+ephemeral path.
+
+This means non-Latin namespace names work transparently
+(`de:Diskussion:Photosynthese`, `ja:トーク:光合成`, etc.) — we never
+parse namespace prefixes ourselves.
+
+#### Window of analysis
+
+The ephemeral path replays at most **N** revisions ending at the
+target (default: **500**). When the page has fewer than N revisions,
+attribution is complete and indistinguishable from the durable path
+for that page. When the page has more than N revisions, attribution
+is *relative to the start of the window*: tokens that existed at the
+window's first revision get `o_rev_id = window_start_rev_id`, not
+their true introduction rev id.
+
+Override via query parameter:
+
+- `window=N` — replay the last N revisions (default 500, capped at
+  2000 to bound per-request latency)
+- `window=full` — replay the entire history. Latency unbounded; use
+  with caution. The server may reject this with 400 for pages over
+  a configurable revision count (default 10 000) to protect the MW
+  API quota.
+
+#### Response envelope additions
+
+When the ephemeral path is taken (any `ns ≠ 0`, or any explicit
+`window=N` query), the response envelope carries two extra fields
+alongside the existing shape from (1)–(6):
+
+```json
+{
+  "article_title": "Talk:Photosynthesis",
+  "page_id": 1234567,
+  "namespace": 1,
+  "ephemeral": true,
+  "window_start_rev_id": 123456000,
+  "window_revisions": 500,
+  "success": true,
+  "message": null,
+  "revisions": [...]
+}
+```
+
+- `namespace` — the MW namespace number (0 = mainspace, 1 = Talk,
+  2 = User, etc.). Mainspace responses also include this for
+  consistency.
+- `ephemeral` — `true` when the response was built from an on-demand
+  replay rather than durable storage. Always `false` for mainspace
+  responses backed by storage.
+- `window_start_rev_id` — the first rev id the algorithm saw, or
+  `null` for `window=full`. Consumers interpret `o_rev_id ==
+  window_start_rev_id` to mean "token was already present at the
+  start of the analysis window — true origin unknown."
+- `window_revisions` — the actual number of revs replayed (≤ `window`
+  query param).
+
+Tokens carrying `o_rev_id == window_start_rev_id` are NOT semantically
+the same as tokens introduced *in* `window_start_rev_id` in mainspace;
+they may have been introduced much earlier. Consumers that highlight
+"new tokens" should treat them as "unknown origin" rather than
+attributing to that revision.
+
+#### Caching semantics
+
+Ephemeral responses are cacheable in a memory-only LRU keyed by
+`(lang, page_id, latest_rev_id_at_request_time, window)`. The cache
+entry becomes stale when the page receives a new revision (detected
+via MW's `lastrevid` or via the EventStreams listener). Default TTL
+1 hour for active discussion pages.
+
+No durable persistence — restarting the server clears the cache.
+
+#### Latency budget
+
+In Rust release mode, the algorithm runs at ~5 ms/rev on contemporary
+hardware. Per ephemeral request:
+
+| Window | MW fetch | Algorithm | Total p99 |
+|--------|---------:|----------:|----------:|
+| 500 revs (default) | ~1.5 s | ~2.5 s | ~4 s |
+| 2000 revs (max) | ~5 s | ~10 s | ~15 s |
+| Full (10 000-rev page) | ~30 s | ~50 s | ~80 s |
+
+The 4-second p99 for the default case is acceptable for talk-page
+hover-to-load UI patterns. The 15-second 2000-rev case is the upper
+bound consumers should expect before timeout (consumer's HTTP client
+should have ≥ 20-second timeout for the ephemeral path; the existing
+mainspace path responds in <100 ms from cache so its timeout can be
+much lower).
+
+#### Reference: Why not durable for all namespaces
+
+Storage budget. Talk pages on contentious articles can accumulate
+50 000+ revisions; supporting them in durable storage would
+significantly expand the per-language disk footprint (STORAGE.md §5
+estimates the current production layout at 224 KB/article compressed,
+already filling 2 TB on en alone). Ephemeral processing lets us
+serve the same data without adding to that budget, accepting a few
+seconds of cold-cache latency in exchange.
+
+If a specific non-mainspace namespace turns out to be high-traffic
+enough that ephemeral processing's MW API hit rate becomes a problem,
+we can selectively flip it to durable storage per namespace — the
+storage format doesn't care which namespace it's serving.
+
 ## URL routing quirks
 
 The current URL patterns have several gotchas; mirror them:
@@ -328,9 +462,20 @@ The current URL patterns have several gotchas; mirror them:
    In the rewrite, prefer explicit query parameters when a title has
    a slash, but keep the 5-digit-rev-id heuristic for backward
    compat.
-2. **Trailing slash matters.** All URLs end with `/`. Requests without
+2. **Colons in titles** are legal both inside mainspace (e.g.
+   `Mission:_Impossible`, `Pride_and_Prejudice:_The_Wild_and_Wanton_Edition`,
+   `Star_Trek:_The_Next_Generation`) and as namespace prefixes
+   (`Talk:Photosynthesis`, `User:Foo`). MediaWiki interprets the prefix
+   before the first `:` as a namespace **only if it matches a known
+   namespace name on that wiki** — otherwise the whole thing stays in
+   mainspace. The rewrite must not try to parse this locally: pass the
+   URL-decoded title straight to the MW Action API (`titles=` param)
+   and use the canonical namespace + page_id it returns. The same is
+   true for non-Latin-script wikis where namespace names are translated
+   (e.g. `de:Diskussion:`, `ja:トーク:`).
+3. **Trailing slash matters.** All URLs end with `/`. Requests without
    the trailing slash currently 301 to the slashed form. Preserve this.
-3. **The `{version}` segment** is currently `v1.0.0-beta` OR `v1.0.0`.
+4. **The `{version}` segment** is currently `v1.0.0-beta` OR `v1.0.0`.
    Both must work.
 
 ## Error codes
