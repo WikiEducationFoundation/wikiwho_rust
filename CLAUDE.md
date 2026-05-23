@@ -72,7 +72,9 @@ Every working session writes a short note to `notes/YYYY-MM-DD-<topic>.md`:
 
 ## Repository status
 
-Implementation phase: **framework + parity-corpus capture (2026-05-22)**. No Rust code yet. The five `.md` files plus `.claude/settings.json` plus `scripts/capture_fixtures.py` plus `parity-fixtures/` plus `notes/` are the entire repo. The next session can start writing Rust against the captured fixtures.
+Active implementation. **Always read the newest file under `notes/` before starting work** — it captures parity numbers, work in flight, queued decisions, and the next session's recommended starting point. Each session ends with a fresh `notes/YYYY-MM-DD-<topic>.md` entry; the chain plus `git log` is the project's running narrative.
+
+`git log --oneline | head` gives the high-level trajectory at a glance.
 
 ## What this project is
 
