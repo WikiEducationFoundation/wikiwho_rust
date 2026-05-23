@@ -1,0 +1,12 @@
+[package]
+name = "wikiwho-attribute"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Token-level authorship attribution for Wikipedia revisions. Algorithm port of wikiwho_api/lib/WikiWho/WikiWho/wikiwho.py."
+
+[dependencies]
+md-5 = { workspace = true }
+regex = { workspace = true }

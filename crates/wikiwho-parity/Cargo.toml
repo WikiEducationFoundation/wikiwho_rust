@@ -1,0 +1,18 @@
+[package]
+name = "wikiwho-parity"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Compare wikiwho-attribute output to captured production fixtures. Reports passing-token and passing-revision counts; this is the ratchet the algorithm port climbs."
+
+[[bin]]
+name = "parity-check"
+path = "src/main.rs"
+
+[dependencies]
+wikiwho-attribute = { path = "../wikiwho-attribute" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
