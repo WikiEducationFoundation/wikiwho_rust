@@ -31,3 +31,6 @@ venv/
 # Build / cache artifacts from any future scripts
 /tmp/
 /.cache/
+
+# Local server scratch — smoke-test storage roots, dev logs.
+/var/
