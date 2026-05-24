@@ -218,6 +218,25 @@ async fn parsoid_handler(
     (*state.parsoid_html).clone()
 }
 
+/// POST handler for `action=parse&text=<wikitext>` — used by the
+/// new wikitext-injection flow's `parse_wikitext`. We don't run a
+/// real MW parser in tests; we just echo the (already-span-decorated)
+/// wikitext back inside the mw-parser-output wrapper so the integration
+/// test can confirm the spans land in the response's extended_html.
+async fn action_parse_post_handler(
+    axum::Form(form): axum::Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let text = form.get("text").cloned().unwrap_or_default();
+    let title = form.get("title").cloned().unwrap_or_default();
+    Json(json!({
+        "parse": {
+            "title": title,
+            "pageid": 0,
+            "text": format!("<div class=\"mw-content-ltr mw-parser-output\">{}</div>", text),
+        }
+    }))
+}
+
 async fn spawn_mock_mw(
     fixture: Fixture,
     parsoid_html: String,
@@ -230,7 +249,7 @@ async fn spawn_mock_mw(
         user_names: Arc::new(user_names),
     };
     let app = Router::new()
-        .route("/w/api.php", get(action_handler))
+        .route("/w/api.php", get(action_handler).post(action_parse_post_handler))
         .route("/api/rest_v1/page/html/{title}/{rev_id}", get(parsoid_handler))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

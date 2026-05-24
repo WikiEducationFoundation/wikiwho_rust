@@ -14,12 +14,22 @@
 //! 2. `SnapshotReader::open` → in-memory [`Article`].
 //! 3. [`get_whocolor_data`] → token + revision data with
 //!    conflict_score / age_seconds.
-//! 4. `mw.resolve_users` → editor user_id → display name.
-//! 5. `mw.fetch_rendered_html` → article HTML (MW Action API
-//!    `action=parse`, matching production's WhoColor pipeline).
-//! 6. [`crate::whocolor_html::inject_spans`] → spans injected; gets
-//!    `present_editors` as a side-effect.
+//! 4. In parallel: `mw.resolve_users` (editor user_id → display
+//!    name) and `mw.fetch_revision_text` (raw wikitext for the
+//!    rev_id).
+//! 5. [`crate::whocolor_wikitext::inject_spans_into_wikitext`] →
+//!    span markup injected at token byte positions in the
+//!    wikitext, producing `present_editors` as a side-effect.
+//! 6. `mw.parse_wikitext` POSTs the decorated wikitext to MW
+//!    Action API `action=parse`; MW preserves the inline span
+//!    tags through to the rendered HTML.
 //! 7. Compose API.md §7 envelope.
+//!
+//! This is the wikitext-level injection flow that matches
+//! production's WhoColor.parser.WikiMarkupParser. HTML-level
+//! injection in `whocolor_html` is still kept for potential
+//! future smart-extractor work but no production code path
+//! uses it.
 //!
 //! Cache miss → spawn the same background fetcher the rev_content
 //! cache-miss path uses and return the 200 "still processing"
@@ -43,7 +53,8 @@ use wikiwho_storage::reader::SnapshotReader;
 use crate::cache_miss;
 use crate::error::ServerError;
 use crate::state::AppState;
-use crate::whocolor_html::{InjectionToken, inject_spans, token_class_name};
+use crate::whocolor_html::token_class_name;
+use crate::whocolor_wikitext::{WikitextToken, inject_spans_into_wikitext};
 
 /// Path params for endpoint 7: `/{lang}/whocolor/{version}/{title}/{rev_id}/`.
 #[derive(serde::Deserialize)]
@@ -161,7 +172,9 @@ async fn serve_whocolor(
         Err(e) => return error_500(ServerError::Internal(e.to_string()), title),
     };
 
-    // 5. Resolve editor display names + Parsoid HTML in parallel.
+    // 5. Resolve editor display names + raw wikitext in parallel.
+    //    The wikitext is the substrate we inject span markup into;
+    //    the resolved usernames go into the response envelope.
     let mw = match state.mw_client(lang) {
         Ok(c) => c,
         Err(e) => {
@@ -173,9 +186,9 @@ async fn serve_whocolor(
         }
     };
     let editor_ids = unique_registered_editor_ids(&data);
-    let html_future = mw.fetch_rendered_html(rev_id);
+    let wikitext_future = mw.fetch_revision_text(rev_id);
     let users_future = mw.resolve_users(&editor_ids);
-    let (html_res, users_res) = tokio::join!(html_future, users_future);
+    let (wikitext_res, users_res) = tokio::join!(wikitext_future, users_future);
 
     let editor_names: HashMap<u64, String> = match users_res {
         Ok(m) => m,
@@ -184,55 +197,91 @@ async fn serve_whocolor(
             HashMap::new()
         }
     };
-    let parsoid_html = match html_res {
-        Ok(h) => h,
+    let wikitext = match wikitext_res {
+        Ok(w) => w,
         Err(wikiwho_mwclient::MwError::PageMissing { .. }) => {
-            // Parsoid says the rev doesn't exist — treat like "not on
-            // disk" for the consumer (they'll retry or fall back).
             return error_503(
-                "Wikipedia REST returned 404 for this revision",
+                "MW returned no wikitext for this revision",
                 title,
                 Some(rev_id),
             );
         }
         Err(e) => {
-            tracing::warn!(lang = %lang, error = %e, "fetch_rendered_html failed");
-            return error_503(&format!("Parsoid fetch failed: {e}"), title, Some(rev_id));
+            tracing::warn!(lang = %lang, error = %e, "fetch_revision_text failed");
+            return error_503(
+                &format!("Wikitext fetch failed: {e}"),
+                title,
+                Some(rev_id),
+            );
         }
     };
 
-    // 6. Inject spans into the HTML.
-    let injection_tokens: Vec<InjectionToken> = data
+    // 6. Inject spans into the wikitext at each token's byte
+    //    position. Mirrors production's WikiMarkupParser approach
+    //    (see whocolor_wikitext.rs). spawn_blocking because the
+    //    regex sweeps + token walk are CPU-bound.
+    let injection_tokens: Vec<WikitextToken> = data
         .tokens
         .iter()
-        .map(|t| InjectionToken {
+        .map(|t| WikitextToken {
             str: t.str.clone(),
             editor: t.editor.clone(),
             class_name: token_class_name(&t.editor),
         })
         .collect();
-    let injection = tokio::task::spawn_blocking(move || inject_spans(&parsoid_html, &injection_tokens))
-        .await
-        .map(Ok)
-        .unwrap_or_else(|join_err| {
-            Err(ServerError::Internal(format!(
-                "span injection task panicked: {join_err}"
-            )))
-        });
+    let wikitext_clone = wikitext.clone();
+    let injection = tokio::task::spawn_blocking(move || {
+        inject_spans_into_wikitext(&wikitext_clone, &injection_tokens)
+    })
+    .await;
     let injection = match injection {
         Ok(i) => i,
-        Err(e) => return error_500(e, title),
+        Err(join_err) => {
+            return error_500(
+                ServerError::Internal(format!(
+                    "wikitext span injection task panicked: {join_err}"
+                )),
+                title,
+            );
+        }
     };
 
-    // 7. Compose the response envelope.
+    // 7. POST the span-decorated wikitext through MW Action API
+    //    `action=parse`. MW's parser carries the inline span tags
+    //    through to the rendered HTML.
+    let extended_html = match mw.parse_wikitext(title, &injection.wikitext).await {
+        Ok(html) => html,
+        Err(e) => {
+            tracing::warn!(lang = %lang, error = %e, "parse_wikitext failed");
+            return error_503(
+                &format!("Wikitext render failed: {e}"),
+                title,
+                Some(rev_id),
+            );
+        }
+    };
+
+    // Convert the wikitext module's PresentEditorEntry to the
+    // envelope-building type (same shape, different module).
+    let present_editors: Vec<crate::whocolor_html::PresentEditorEntry> = injection
+        .present_editors
+        .into_iter()
+        .map(|e| crate::whocolor_html::PresentEditorEntry {
+            editor: e.editor,
+            class_name: e.class_name,
+            token_count: e.token_count,
+        })
+        .collect();
+
+    // 8. Compose the response envelope.
     let body = build_whocolor_envelope(
         &article,
         title,
         rev_id,
         &data,
         &editor_names,
-        injection.html,
-        &injection.present_editors,
+        extended_html,
+        &present_editors,
     );
     (StatusCode::OK, Json(body)).into_response()
 }
