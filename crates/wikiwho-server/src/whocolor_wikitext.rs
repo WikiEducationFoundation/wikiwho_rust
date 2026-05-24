@@ -396,8 +396,17 @@ impl<'a> Parser<'a> {
 
     /// Compute the end position of the given special element.
     /// For a Single markup, end == start + start_len. For a Block
-    /// markup, scans forward for the end regex; if no end match is
-    /// found, treats the markup as ending at end-of-wikitext.
+    /// markup, scans forward FROM THE CURRENT CURSOR for the end
+    /// regex; if no end match is found, treats the markup as
+    /// ending at end-of-wikitext.
+    ///
+    /// The cursor-relative search is load-bearing: when called
+    /// inside a recursion after a nested markup has been
+    /// processed, `wiki_text_pos` is past the nested markup's end,
+    /// so the search picks up the OUTER markup's `}}` rather than
+    /// the (already-processed) nested one's. Mirrors Python's
+    /// `WikiMarkupParser.__get_special_elem_end` which uses
+    /// `_wiki_text_pos`.
     fn special_elem_end(&self, se: &SpecialElem) -> SpecialElemEnd {
         let markup = &SPECIAL_MARKUPS[se.markup_idx];
         match markup.kind {
@@ -410,7 +419,10 @@ impl<'a> Parser<'a> {
                     .end
                     .as_ref()
                     .expect("block markup must have end regex");
-                let search_from = se.start + se.start_len;
+                // Search from the current cursor — not from
+                // `se.start + se.start_len` — so already-consumed
+                // nested-markup ends don't get returned again.
+                let search_from = self.wiki_text_pos;
                 if search_from >= self.wiki_text.len() {
                     return SpecialElemEnd {
                         start: self.wiki_text.len(),
@@ -816,5 +828,51 @@ mod tests {
         // bar gets the leading space absorbed.
         assert!(out.wikitext.contains(">foo</span>"));
         assert!(out.wikitext.contains("> bar</span>"));
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    fn t(s: &str, editor: &str, class_name: &str) -> WikitextToken {
+        WikitextToken {
+            str: s.into(),
+            editor: editor.into(),
+            class_name: class_name.into(),
+        }
+    }
+
+    /// Repro of the Curzon_Ultimatum bug observed on the first
+    /// WMCloud whocolor deploy: spans got injected INSIDE a
+    /// `{{Infobox treaty | ... }}` parameter list (template
+    /// no_spans=true), breaking MW's parameter parsing. The Infobox
+    /// contained a nested `{{bulleted list | [[link]] | [[link]] }}`
+    /// — after the inner template's recursion returned, a stray
+    /// span was emitted before the Infobox continued.
+    #[test]
+    fn nested_template_inside_template_does_not_emit_spans() {
+        // Simplified Infobox structure mirroring the Curzon case.
+        let wikitext = "{{Infobox |a = {{nest |[[L1]] |[[L2]]}}|b = end}}";
+        // Tokens (the algorithm tokenizes wikitext including the
+        // wiki markers; for this test we just include the words).
+        let toks = vec![
+            t("infobox", "1", "1"),
+            t("a", "1", "1"),
+            t("nest", "1", "1"),
+            t("l1", "1", "1"),
+            t("l2", "1", "1"),
+            t("b", "1", "1"),
+            t("end", "1", "1"),
+        ];
+        let out = inject_spans_into_wikitext(wikitext, &toks);
+        // No spans should appear anywhere inside the OUTER `{{Infobox ...}}`.
+        // The outer template starts at byte 0 and ends at the matching `}}`.
+        let infobox_close = out.wikitext.rfind("}}").unwrap() + 2;
+        let infobox_body = &out.wikitext[0..infobox_close];
+        assert!(
+            !infobox_body.contains("<span class=\"editor-token"),
+            "no spans should appear inside {{{{Infobox ...}}}}, got: {infobox_body}"
+        );
     }
 }
