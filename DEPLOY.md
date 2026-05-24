@@ -88,7 +88,12 @@ Horizon → Network → **Web Proxies** → **Add Web Proxy**:
 |---|---|
 | Hostname | e.g. `wikiwho-rs` (becomes `wikiwho-rs.wmcloud.org`) |
 | Backend instance | `wikiwho-rs-1` |
+| Backend protocol | `http` |
 | Backend port | `80` |
+
+The Horizon proxy terminates TLS at its edge and forwards plain
+HTTP to the VPS. The nginx config we ship listens on `:80` with
+no TLS of its own.
 
 Wait ~30 seconds for DNS to propagate, then verify from your
 laptop:
