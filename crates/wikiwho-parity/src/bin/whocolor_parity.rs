@@ -29,11 +29,22 @@
 //!   expected, not a bug.
 //!
 //! Usage:
-//!   whocolor-parity                       # all fixtures
+//!   whocolor-parity                       # all fixtures vs prod whocolor.json
 //!   whocolor-parity zh/1686258            # one fixture by lang/page_id
 //!   whocolor-parity --fixtures path/to/   # alternative root
-//!   whocolor-parity --check-age           # also compare per-token age
+//!   whocolor-parity --check-age           # also compare per-token age (prod mode)
 //!   whocolor-parity --show-first-diff     # print first per-fixture divergence
+//!   whocolor-parity --python-replay       # compare vs a fresh Python wikiwho.py replay
+//!   whocolor-parity --refresh-python      # force regenerate python_whocolor_replay.json
+//!
+//! With `--python-replay`, the reference is `scripts/python_replay.py
+//! --whocolor`'s output (cached at `<fixture>/python_whocolor_replay.
+//! json`) instead of `whocolor.json`. That removes the prod-cache-
+//! drift confound documented in `notes/2026-05-23-whocolor-parity.md`:
+//! ja/4821051 and en/62750956 fail vs prod but are 100% vs Python. The
+//! `age` field is not emitted by `--whocolor` (it depends on Python's
+//! `datetime.now()` at script-invocation time), so `--check-age` is a
+//! no-op in python-replay mode.
 //!
 //! Each fixture reports `tokens_pass/total`, `revisions_pass/total`,
 //! and the per-field exact-match score. Exit non-zero if any
@@ -74,18 +85,43 @@ struct HistoryEntry {
     text_hidden: bool,
 }
 
-/// Parsed view of the captured `whocolor.json`. We deserialize only
-/// the fields we'll compare against.
+/// Parsed view of the comparison source — either production's
+/// captured `whocolor.json` or `scripts/python_replay.py --whocolor`'s
+/// output. Both share the same wire shape for `tokens` / `revisions` /
+/// `biggest_conflict_score`. Python mode skips the `age` element on
+/// each token tuple and sets `success`/`rev_id` synthetically.
 #[derive(Debug, Deserialize)]
-struct ProdWhoColor {
+struct ComparisonSource {
+    #[serde(default = "default_true")]
     success: bool,
     rev_id: u64,
     biggest_conflict_score: u32,
     /// `[conflict_score, str, o_rev_id, in, out, class_name, age]`
-    /// per API.md §7. We model this as `serde_json::Value` because
-    /// the tuple's last element is a float and the rest are mixed.
+    /// per API.md §7 (production mode) or the same minus `age` in
+    /// python-replay mode. We model this as `serde_json::Value`
+    /// because the tuple's last element is a float and the rest are
+    /// mixed.
     tokens: Vec<serde_json::Value>,
     /// `rev_id_string → [timestamp, parent_id, class_name, editor_name]`.
+    revisions: BTreeMap<String, Vec<serde_json::Value>>,
+}
+
+fn default_true() -> bool { true }
+
+/// Wrapper for the python_replay.py output shape — only used to extract
+/// the `whocolor` sub-object before reshaping it into a
+/// [`ComparisonSource`]. The rest of the fields (spam_ids, token_count,
+/// etc.) are useful diagnostics but not consumed here.
+#[derive(Debug, Deserialize)]
+struct PythonReplayEnvelope {
+    target_rev_id: u64,
+    whocolor: Option<PythonWhocolor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PythonWhocolor {
+    biggest_conflict_score: u32,
+    tokens: Vec<serde_json::Value>,
     revisions: BTreeMap<String, Vec<serde_json::Value>>,
 }
 
@@ -99,7 +135,11 @@ fn default_fixtures_root() -> PathBuf {
         .unwrap_or_else(|_| Path::new(manifest_dir).join("../../parity-fixtures"))
 }
 
-fn walk_fixtures(root: &Path, filters: &[String]) -> Result<Vec<PathBuf>> {
+fn walk_fixtures(
+    root: &Path,
+    filters: &[String],
+    python_mode: bool,
+) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let lang_dirs = fs::read_dir(root)
         .with_context(|| format!("reading {}", root.display()))?;
@@ -119,10 +159,15 @@ fn walk_fixtures(root: &Path, filters: &[String]) -> Result<Vec<PathBuf>> {
                     continue;
                 }
                 let dir = rev.path();
-                if !dir.join("whocolor.json").exists()
-                    || !dir.join("history.jsonl").exists()
+                // Both modes need history + meta; only prod mode needs
+                // the captured whocolor.json (python mode generates its
+                // own reference via the replay script).
+                if !dir.join("history.jsonl").exists()
                     || !dir.join("meta.json").exists()
                 {
+                    continue;
+                }
+                if !python_mode && !dir.join("whocolor.json").exists() {
                     continue;
                 }
                 let rel: String = dir
@@ -192,7 +237,7 @@ fn compare_tokens(
     metrics.tokens_total = prod.len();
     if rust.len() != prod.len() {
         metrics.first_token_diff = Some(format!(
-            "token count differs: rust={} prod={}",
+            "token count differs: rust={} expected={}",
             rust.len(),
             prod.len()
         ));
@@ -290,21 +335,21 @@ fn format_token_diff(
     let mut bad: Vec<String> = Vec::new();
     if !score.conflict_score {
         bad.push(format!(
-            "conflict_score: rust={} prod={}",
+            "conflict_score: rust={} expected={}",
             rt.conflict_score,
             pt.first().and_then(|v| v.as_u64()).unwrap_or(0),
         ));
     }
     if !score.str {
         bad.push(format!(
-            "str: rust={:?} prod={:?}",
+            "str: rust={:?} expected={:?}",
             rt.str,
             pt.get(1).and_then(|v| v.as_str()).unwrap_or(""),
         ));
     }
     if !score.o_rev_id {
         bad.push(format!(
-            "o_rev_id: rust={} prod={}",
+            "o_rev_id: rust={} expected={}",
             rt.o_rev_id,
             pt.get(2).and_then(|v| v.as_u64()).unwrap_or(0),
         ));
@@ -315,7 +360,7 @@ fn format_token_diff(
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
             .unwrap_or_default();
-        bad.push(format!("in: rust={:?} prod={:?}", rt.inbound, prod));
+        bad.push(format!("in: rust={:?} expected={:?}", rt.inbound, prod));
     }
     if !score.outbound {
         let prod: Vec<u64> = pt
@@ -323,11 +368,11 @@ fn format_token_diff(
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
             .unwrap_or_default();
-        bad.push(format!("out: rust={:?} prod={:?}", rt.outbound, prod));
+        bad.push(format!("out: rust={:?} expected={:?}", rt.outbound, prod));
     }
     if !score.class_name {
         bad.push(format!(
-            "class_name: rust={} prod={:?}",
+            "class_name: rust={} expected={:?}",
             wikiwho_server::whocolor_html::token_class_name(&rt.editor),
             pt.get(5).and_then(|v| v.as_str()).unwrap_or(""),
         ));
@@ -345,7 +390,7 @@ fn compare_revisions(
         let rid_key = rid.to_string();
         let Some(prod_entry) = prod_revisions.get(&rid_key) else {
             if metrics.first_rev_diff.is_none() {
-                metrics.first_rev_diff = Some(format!("rust rev {rid} absent from prod"));
+                metrics.first_rev_diff = Some(format!("rust rev {rid} absent from expected"));
             }
             continue;
         };
@@ -371,7 +416,7 @@ fn compare_revisions(
         } else if metrics.first_rev_diff.is_none() {
             metrics.first_rev_diff = Some(format!(
                 "rev {rid}: ts_match={ts_match} parent_match={parent_match} class_match={class_match}; \
-                rust=({}, {}, {}) prod=({:?}, {:?}, {:?})",
+                rust=({}, {}, {}) expected=({:?}, {:?}, {:?})",
                 rev.timestamp,
                 rev.parent_rev_id,
                 class_name_rust,
@@ -388,7 +433,7 @@ fn compare_revisions(
 /// `age = capture_now - origin_timestamp`, so
 /// `capture_now ≈ age + origin_timestamp_unix`. We average across the
 /// first ~10 tokens to dampen rounding noise.
-fn infer_capture_now(rust: &WhoColorData, prod: &ProdWhoColor) -> Option<i64> {
+fn infer_capture_now(rust: &WhoColorData, prod: &ComparisonSource) -> Option<i64> {
     let mut samples: Vec<f64> = Vec::new();
     let n = rust.tokens.len().min(prod.tokens.len()).min(10);
     for i in 0..n {
@@ -418,6 +463,13 @@ struct Args {
     filters: Vec<String>,
     check_age: bool,
     show_first_diff: bool,
+    /// Compare against a fresh Python wikiwho.py replay (cached at
+    /// `<fixture>/python_whocolor_replay.json`) instead of the captured
+    /// production `whocolor.json`. Eliminates prod-cache drift.
+    python_replay: bool,
+    /// Force re-running the Python reference even if a cached
+    /// `python_whocolor_replay.json` exists. Implies `--python-replay`.
+    refresh_python: bool,
 }
 
 fn parse_args() -> Args {
@@ -427,6 +479,8 @@ fn parse_args() -> Args {
         filters: Vec::new(),
         check_age: false,
         show_first_diff: false,
+        python_replay: false,
+        refresh_python: false,
     };
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -438,12 +492,18 @@ fn parse_args() -> Args {
             }
             "--check-age" => out.check_age = true,
             "--show-first-diff" => out.show_first_diff = true,
+            "--python-replay" => out.python_replay = true,
+            "--refresh-python" => {
+                out.python_replay = true;
+                out.refresh_python = true;
+            }
             "-h" | "--help" => {
                 eprintln!("{}", env!("CARGO_PKG_DESCRIPTION"));
                 eprintln!();
                 eprintln!(
                     "Usage: whocolor-parity [--fixtures DIR] [--check-age] \
-                     [--show-first-diff] [LANG/PAGE_ID ...]"
+                     [--show-first-diff] [--python-replay] [--refresh-python] \
+                     [LANG/PAGE_ID ...]"
                 );
                 std::process::exit(0);
             }
@@ -455,23 +515,93 @@ fn parse_args() -> Args {
 
 // ---------------- per-fixture driver ----------------
 
+/// Run `scripts/python_replay.py --whocolor` if the cache is missing
+/// or `--refresh-python` was set. Cache lives at
+/// `<fixture>/python_whocolor_replay.json` and is regeneratable from
+/// `history.jsonl` alone.
+fn load_python_whocolor(
+    fixture: &Path,
+    meta: &Meta,
+    refresh: bool,
+) -> Result<ComparisonSource> {
+    let cache = fixture.join("python_whocolor_replay.json");
+    if !cache.exists() || refresh {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts")
+            .join("python_replay.py");
+        eprintln!(
+            "  [python] regenerating {} via {}",
+            cache.display(),
+            script.display(),
+        );
+        let output = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(fixture)
+            .arg("--whocolor")
+            .output()
+            .with_context(|| format!("invoking python3 {}", script.display()))?;
+        if !output.status.success() {
+            bail!(
+                "python_replay.py failed (status {}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        fs::write(&cache, &output.stdout)
+            .with_context(|| format!("writing {}", cache.display()))?;
+    }
+    let bytes = fs::read(&cache)
+        .with_context(|| format!("reading {}", cache.display()))?;
+    let envelope: PythonReplayEnvelope = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", cache.display()))?;
+    if envelope.target_rev_id != meta.rev_id {
+        bail!(
+            "{}: python_whocolor_replay.target_rev_id={} disagrees with meta.rev_id={}",
+            meta.title,
+            envelope.target_rev_id,
+            meta.rev_id,
+        );
+    }
+    let wc = envelope.whocolor.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: python_whocolor_replay has whocolor=null — Python flagged \
+             target rev as spam or unreachable",
+            meta.title,
+        )
+    })?;
+    Ok(ComparisonSource {
+        success: true,
+        rev_id: meta.rev_id,
+        biggest_conflict_score: wc.biggest_conflict_score,
+        tokens: wc.tokens,
+        revisions: wc.revisions,
+    })
+}
+
 fn process_one(fixture: &Path, args: &Args) -> Result<FixtureMetrics> {
     let meta: Meta = serde_json::from_str(
         &fs::read_to_string(fixture.join("meta.json"))?,
     )?;
-    let prod: ProdWhoColor =
-        serde_json::from_str(&fs::read_to_string(fixture.join("whocolor.json"))?)?;
-    if !prod.success {
-        bail!("{}: whocolor.json success=false; refusing to parity-check", meta.title);
-    }
-    if prod.rev_id != meta.rev_id {
-        bail!(
-            "{}: meta.rev_id={} disagrees with whocolor.rev_id={}",
-            meta.title,
-            meta.rev_id,
-            prod.rev_id,
-        );
-    }
+    let source: ComparisonSource = if args.python_replay {
+        load_python_whocolor(fixture, &meta, args.refresh_python)?
+    } else {
+        let s: ComparisonSource =
+            serde_json::from_str(&fs::read_to_string(fixture.join("whocolor.json"))?)?;
+        if !s.success {
+            bail!("{}: whocolor.json success=false; refusing to parity-check", meta.title);
+        }
+        if s.rev_id != meta.rev_id {
+            bail!(
+                "{}: meta.rev_id={} disagrees with whocolor.rev_id={}",
+                meta.title,
+                meta.rev_id,
+                s.rev_id,
+            );
+        }
+        s
+    };
 
     let history_text = fs::read_to_string(fixture.join("history.jsonl"))?;
     let entries: Vec<HistoryEntry> = history_text
@@ -498,11 +628,15 @@ fn process_one(fixture: &Path, args: &Args) -> Result<FixtureMetrics> {
         });
     }
 
-    // We need an initial run to derive the capture-now timestamp.
+    // Probe at capture_now=0 to get deterministic fields; recompute with
+    // the inferred capture_now only when --check-age is on AND the source
+    // has age data to infer from (prod whocolor.json does, python_replay
+    // doesn't).
     let probe = get_whocolor_data(&article, meta.rev_id, 0)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let capture_now = infer_capture_now(&probe, &prod).unwrap_or(0);
-    let rust_data = if args.check_age {
+    let check_age = args.check_age && !args.python_replay;
+    let rust_data = if check_age {
+        let capture_now = infer_capture_now(&probe, &source).unwrap_or(0);
         get_whocolor_data(&article, meta.rev_id, capture_now)
             .map_err(|e| anyhow::anyhow!("{e}"))?
     } else {
@@ -511,11 +645,11 @@ fn process_one(fixture: &Path, args: &Args) -> Result<FixtureMetrics> {
 
     let mut m = FixtureMetrics {
         biggest_conflict_matches: rust_data.biggest_conflict_score
-            == prod.biggest_conflict_score,
+            == source.biggest_conflict_score,
         ..Default::default()
     };
-    compare_tokens(&rust_data.tokens, &prod.tokens, args.check_age, &mut m);
-    compare_revisions(&rust_data, &prod.revisions, &mut m);
+    compare_tokens(&rust_data.tokens, &source.tokens, check_age, &mut m);
+    compare_revisions(&rust_data, &source.revisions, &mut m);
     Ok(m)
 }
 
@@ -525,7 +659,7 @@ fn pct(numer: usize, denom: usize) -> f64 {
 
 fn main() -> Result<()> {
     let args = parse_args();
-    let fixtures = walk_fixtures(&args.fixtures, &args.filters)?;
+    let fixtures = walk_fixtures(&args.fixtures, &args.filters, args.python_replay)?;
     if fixtures.is_empty() {
         eprintln!("no whocolor fixtures matched filters");
         std::process::exit(1);
@@ -548,10 +682,12 @@ fn main() -> Result<()> {
     let mut field_age = 0usize;
     let mut age_checked = 0usize;
 
+    let source_label = if args.python_replay { "vs python" } else { "vs prod-cache" };
     println!(
-        "Whocolor parity ({} fixtures, age check {})",
+        "Whocolor parity ({} fixtures, {}, age check {})",
         fixtures.len(),
-        if args.check_age { "ON" } else { "off" },
+        source_label,
+        if args.check_age && !args.python_replay { "ON" } else { "off" },
     );
     println!();
     println!(
