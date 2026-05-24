@@ -186,25 +186,35 @@ it doesn't.
 
 ### Re-deploy after a code change
 
-Single command on the VPS:
+**From your laptop** (no SSH-then-run two-step):
+
+```bash
+./scripts/remote-deploy.sh                 # plain redeploy
+./scripts/remote-deploy.sh --wipe-storage  # also wipe storage
+./scripts/remote-deploy.sh --ref some-sha  # deploy a specific commit
+```
+
+That ProxyJumps through `bastion.wmcloud.org` and runs
+`sudo wikiwho-redeploy` on the VPS. Defaults assume your Wikitech
+username is `$USER` and the VPS hostname is `wikiwho-rust.
+globaleducation.eqiad1.wikimedia.cloud`; override with `WIKITECH_USER=`
+and `VPS_HOST=` env vars if either is wrong.
+
+**On the VPS directly** (if you're already SSH'd in):
 
 ```bash
 sudo wikiwho-redeploy
+sudo wikiwho-redeploy --ref <branch-or-sha>   # specific commit
+sudo wikiwho-redeploy --wipe-storage          # SCHEMA_VERSION bump
 ```
 
-That pulls `main`, rebuilds the release binaries, installs them,
-restarts both systemd units, and verifies `/healthz`. Options:
+Both paths pull `main` (or the named ref), rebuild release binaries,
+install them, restart both systemd units, and verify `/healthz`.
 
-```bash
-sudo wikiwho-redeploy --ref <branch-or-sha>   # deploy a specific commit
-sudo wikiwho-redeploy --wipe-storage          # after a SCHEMA_VERSION bump
-```
-
-(First time on an older VPS: run `sudo bash
-/home/wikiwho/wikiwho_rust/deployment/redeploy.sh` once — that
-self-installs the `/usr/local/bin/wikiwho-redeploy` symlink for
-subsequent invocations. Setups created after this change have it
-from first boot.)
+(First time on an older VPS where the symlink doesn't exist yet,
+run `sudo bash /home/wikiwho/wikiwho_rust/deployment/redeploy.sh`
+once — that self-installs `/usr/local/bin/wikiwho-redeploy`. Setups
+created after this change have it from first boot.)
 
 ### Check disk and memory
 
