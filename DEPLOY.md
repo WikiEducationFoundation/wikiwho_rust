@@ -34,7 +34,7 @@ Horizon → Compute → Instances → **Launch Instance**:
 | Instance Name | `wikiwho-rs-1` |
 | Source | Image: latest **Debian** (12 or 13) |
 | Flavor | `g3.cores4.ram8.disk20` (or similar). Bigger disk = more headroom for cache-miss growth. |
-| Networks | `lan-flat-cloudinstances2b` |
+| Networks | The project default (currently `VXLAN/IPv6-dualstack`) |
 | Security Groups | `default`, `web` |
 | Key Pair | Your registered key |
 
