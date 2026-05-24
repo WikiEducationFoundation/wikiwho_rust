@@ -160,23 +160,37 @@ No consumer has surfaced a problem yet; deferred.
 The wikitext-injection flow is the last major missing piece for
 consumer-side correctness. Concrete follow-ups:
 
-1. **Broader consumer testing.** Sage's Dashboard test was on
-   simplewiki + a handful of articles; bigger articles, more
-   languages, and the WhoWroteThat gadget would exercise edge
-   cases.
-2. **Operational instrumentation.** Disk usage trend, cache-miss
-   p50/p99 latency, MW Action API rate-limit behavior under
-   sustained ingest/cache-miss load. A `notes/cutover/02-<date>-
-   observations.md` after a few days of running would be useful.
-3. **Cleanup of `whocolor_html.rs`.** Now unused in the production
-   code path; HTML-level injection is dead code that we kept "for
-   the smart-extractor follow-up" — that's probably no longer the
-   right path; consider dropping the module entirely.
+1. **Icaro template-bleed bug.** Filed in
+   `notes/decisions-needed.md` (2026-05-24 entry). Synthetic
+   test passes, real wikitext repros. Next session: enable the
+   trace stub I removed (see commit history for `WIKIWHO_TRACE`)
+   and dump iteration state between cursor=54 and cursor=113 to
+   find why `find_next_special_markup` / the recurse-check
+   doesn't fire for the inner `{{more citations needed}}`. Test
+   harness `tests/icaro_repro.rs` is `#[ignore]`'d and ready to
+   re-run.
+2. **Broader consumer testing.** Today covered the first 20 of
+   660 articles in the Wiki Experts course. Run the rest in
+   batches (the suite at `/tmp/whocolor_parity_suite.py` is
+   re-runnable; storage-wipe + run was ~5 min for 20 articles
+   first-time).
+3. **Cleanup of `whocolor_html.rs`.** Now unused in the
+   production code path. HTML-level injection module + tests can
+   be deleted; we'd reintroduce if a smart-extractor approach
+   ever becomes interesting.
 4. **Title canonicalization** if a consumer surfaces a mismatch
    (case folding for non-ASCII titles, redirect handling).
 
-Recommendation: **2** (observation) for at least one more session
-before any further code, since today's two bug fixes were both
-"surfaced by live operation, not by the parity corpus" — letting
-the deploy run for a few days will tell us what else is hiding
-behind the parity corpus's blind spots.
+**Parity suite results (20 articles, span-count parity vs production):**
+
+- 20 / 20 OK on span count
+- 1 / 20 PREVIEW_WARN+UNKNOWN_PARAM (Icaro — see decisions queue)
+- 1 / 20 PROD_FAILED (Theatrical_technician — production-side
+  issue, our side returned success)
+- Cache-miss prep times: min 2.3s, max 69.1s, avg 16.0s (averages
+  are skewed by the cache being warm for the first 6 articles)
+
+Recommendation: **1** (Icaro bug) for the next short session,
+since the trace work is small once the investigation is fresh
+and a single edge-case template structure shouldn't gate further
+work.

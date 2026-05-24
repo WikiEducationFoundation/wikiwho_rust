@@ -20,6 +20,70 @@ Format:
 
 ---
 
+## 2026-05-24 — WhoColor wikitext-injection: Icaro `{{multiple issues}}` template bleed [non-blocking]
+
+**Context:** After landing wikitext-level span injection and the
+cursor-relative `special_elem_end` fix (commit `ee221b9`), running
+parity-suite against the first 20 articles of the Wiki Experts 2025
+Dashboard course gave 20/20 span-count parity, but 1 article
+(**en/Icaro**) still produces a `Preview warning: Page using
+Template:Multiple_issues with unknown parameter "<templatestyles>
+...<table class=\"box-More_ci..."`. Our wikitext-injection parser
+emits a `<span class="editor-token ...">}}</span>` around the
+**outer** `}}` of `{{multiple issues|...}}` (token-31 in the
+captured token list), placing span markup inside what MW thinks
+is the template's parameter list.
+
+**Investigation so far:**
+
+- Synthetic test case
+  `whocolor_wikitext::icaro_regression::multiple_issues_with_
+  newline_nested_templates` PASSES — the bug doesn't reproduce
+  with hand-written tokens for an analogous structure.
+- `tests/icaro_repro.rs` (marked `#[ignore]`) with the real Icaro
+  wikitext + the actual algorithm token list reproduces the bug.
+- Tracing shows the multiple-issues recursion enters at cursor=54
+  with `special_elem_end = (111, 113)` (the inner
+  `{{more citations needed}}`'s `}}`), but then **never recurses
+  into `{{more citations needed}}`**. The next ENTER in the trace
+  is for a `=` heading recursion at cursor=100, inside the inner
+  template. Multiple-issues exits at cursor=113 (the inner `}}`)
+  thinking that was its own end, and the OUTER frame
+  (add_spans=true) then processes the outer `}}` (token-31) as a
+  normal token, wrapping it in a span.
+- Open question: why does `find_next_special_markup` (or the
+  `nse.start < token_end` check) fail to trigger recursion into
+  `{{more citations needed}}` at cursor=72? My armchair trace says
+  it should — `{{` at 72, token-12's end at 74, see.start=111, so
+  the recurse-into-nested-markup branch should fire. But the
+  trace shows we never enter that recursion. Probably an
+  interaction with the General-HTML-Tag regex (which matches
+  `<b`, `<i`, `<p`, etc. — could it match somewhere unexpected
+  in the wikitext before position 72?) or with token-12's actual
+  byte position being different from what I assumed.
+
+**Options:**
+- **A. Continue the trace investigation.** Next session: enable
+  the trace I left disabled, dump every iteration's
+  `(token_index, cursor, token_end, next_special, special_elem_end)`
+  between cursor=54 and cursor=113. The trace will pinpoint why
+  the recursion check fails.
+- **B. Port the Python WikiMarkupParser more literally.** Our
+  current port is a rewrite based on understanding; maybe a more
+  mechanical translation surfaces a behavior difference.
+- **C. Accept and document.** 1/20 articles flagged in initial
+  parity-suite; the consumers (Dashboard ArticleViewer) get a
+  rendered article that has a benign preview warning at the top
+  but otherwise correct highlighting. Document and move on.
+
+**Recommendation:** **A** in the next dedicated session (the trace
+work is small once the investigation is fresh). C in the
+meantime: the bug is bounded (only fires on specific
+nested-template-with-newline patterns), and consumers see
+correct highlighting even when the warning appears.
+
+---
+
 ## 2026-05-24 — WhoColor HTML source: Parsoid vs MW Action API parse [resolved-with-followup]
 
 **Context:** PLAN.md §4.6 resolved on MW REST `/page/html` (Parsoid)

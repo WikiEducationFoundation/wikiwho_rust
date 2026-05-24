@@ -1884,6 +1884,7 @@ dependencies = [
  "html5ever",
  "markup5ever_rcdom",
  "md-5",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

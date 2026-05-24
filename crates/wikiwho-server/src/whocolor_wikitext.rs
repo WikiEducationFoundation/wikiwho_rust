@@ -876,3 +876,9 @@ mod regression_tests {
         );
     }
 }
+
+// The Icaro regression test was synthetic and didn't reproduce
+// the real bug (which only fires with the actual algorithm token
+// list). The real repro lives in `tests/icaro_repro.rs`
+// (`#[ignore]`d) and is documented in
+// `notes/decisions-needed.md` (2026-05-24 entry).
