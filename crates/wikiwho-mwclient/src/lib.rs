@@ -199,6 +199,62 @@ impl MwClient {
         parse_page_info(&body)
     }
 
+    /// Fetch the raw wikitext for a single revision via
+    /// `action=query&prop=revisions&rvprop=content&rvslots=main&
+    /// revids={rev_id}&formatversion=2`.
+    ///
+    /// Returns the body of `query.pages[0].revisions[0].slots.main.
+    /// content`. Used by the WhoColor handler's wikitext-level
+    /// injection flow — we fetch the wikitext, inject span markup
+    /// at token positions, then send the modified wikitext through
+    /// [`Self::parse_wikitext`] to render to HTML.
+    pub async fn fetch_revision_text(&self, rev_id: u64) -> Result<String> {
+        let rev_id_s = rev_id.to_string();
+        let body = self
+            .request_json(&[
+                ("action", "query"),
+                ("format", "json"),
+                ("formatversion", "2"),
+                ("prop", "revisions"),
+                ("rvprop", "content"),
+                ("rvslots", "main"),
+                ("revids", rev_id_s.as_str()),
+            ])
+            .await?;
+
+        // Same badrevids signal as resolve_rev_id.
+        if body
+            .get("query")
+            .and_then(|q| q.get("badrevids"))
+            .is_some()
+        {
+            return Err(MwError::PageMissing { page_id: 0 });
+        }
+
+        let page = body
+            .get("query")
+            .and_then(|q| q.get("pages"))
+            .and_then(|p| p.as_array())
+            .and_then(|arr| arr.first())
+            .ok_or_else(|| MwError::Shape("missing query.pages[0]".into()))?;
+
+        if page.get("missing").and_then(|v| v.as_bool()).unwrap_or(false)
+            || page.get("invalid").is_some()
+        {
+            return Err(MwError::PageMissing { page_id: 0 });
+        }
+
+        page.get("revisions")
+            .and_then(|r| r.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|rev| rev.get("slots"))
+            .and_then(|s| s.get("main"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| MwError::Shape("missing revisions[0].slots.main.content".into()))
+    }
+
     /// Resolve a batch of `user_id`s to `(user_id, user_name)` pairs.
     ///
     /// Used by the WhoColor endpoint to map editor IDs to display
@@ -312,6 +368,53 @@ impl MwClient {
             .and_then(|t| t.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| MwError::Shape("action=parse: missing parse.text".into()))
+    }
+
+    /// Render arbitrary wikitext to HTML via MW Action API
+    /// `action=parse&prop=text&title={title}&text={wikitext}&
+    /// formatversion=2`, POSTed because wikitext can be MB-sized.
+    ///
+    /// Used by the WhoColor handler's wikitext-level injection
+    /// pipeline: we inject `<span ...>` markup into the wikitext at
+    /// token positions, then ask MW to render the modified
+    /// wikitext. MW's parser preserves the inline span tags, giving
+    /// us HTML with embedded span attribution by construction —
+    /// matches production's approach (cf. `WhoColor.utils.
+    /// WikipediaRevText.convert_wiki_text_to_html`).
+    pub async fn parse_wikitext(&self, title: &str, wikitext: &str) -> Result<String> {
+        let body = match self
+            .request_json_post(&[
+                ("action", "parse"),
+                ("title", title),
+                ("text", wikitext),
+                ("prop", "text"),
+                ("format", "json"),
+                ("formatversion", "2"),
+                // contentmodel defaults to wikitext for namespace 0 titles
+                // but be explicit so non-mainspace titles parse the same.
+                ("contentmodel", "wikitext"),
+                // No section number == parse the whole thing.
+            ])
+            .await
+        {
+            Ok(b) => b,
+            Err(MwError::Api { code, info }) => {
+                if matches!(
+                    code.as_str(),
+                    "missingtitle" | "nosuchrevid" | "invalidpageid" | "nosuchpageid"
+                ) {
+                    return Err(MwError::PageMissing { page_id: 0 });
+                }
+                return Err(MwError::Api { code, info });
+            }
+            Err(e) => return Err(e),
+        };
+
+        body.get("parse")
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| MwError::Shape("action=parse (text=): missing parse.text".into()))
     }
 
     /// Low-level GET that returns the response body as a string.
@@ -485,6 +588,89 @@ impl MwClient {
                 return Err(MwError::Api { code, info });
             }
             let _ = last_retry_after; // silence unused on success path
+            return Ok(body);
+        }
+    }
+
+    /// Like [`Self::request_json`] but POSTs `params` as
+    /// `application/x-www-form-urlencoded`. Required for `action=parse&
+    /// text=<wikitext>` because the wikitext can exceed URL length
+    /// limits (multi-MB on Obama-class articles).
+    pub async fn request_json_post(&self, params: &[(&str, &str)]) -> Result<serde_json::Value> {
+        let mut attempt = 0u32;
+        let mut slept: Duration = Duration::ZERO;
+
+        loop {
+            attempt += 1;
+            let response = self
+                .http
+                .post(&self.api_url)
+                .form(params)
+                .header("User-Agent", &self.user_agent)
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(r) => r,
+                Err(e) if attempt < self.retry_max_attempts && transient(&e) => {
+                    let delay = self.backoff_for(attempt);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(e) => return Err(MwError::Http(e)),
+            };
+
+            let status = response.status();
+
+            if status.as_u16() == 429 {
+                let ra = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| self.backoff_for(attempt));
+                let remaining = self.retry_budget.saturating_sub(slept);
+                if remaining.is_zero() {
+                    return Err(MwError::RateLimitBudgetExhausted {
+                        slept_seconds: slept.as_secs(),
+                        last_retry_after_seconds: ra.as_secs(),
+                    });
+                }
+                let sleep_for = ra.min(remaining);
+                slept += sleep_for;
+                tokio::time::sleep(sleep_for).await;
+                continue;
+            }
+
+            if status.is_server_error() && attempt < self.retry_max_attempts {
+                tokio::time::sleep(self.backoff_for(attempt)).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(MwError::Shape(format!(
+                    "HTTP {}: {}",
+                    status,
+                    truncate(&body, 300)
+                )));
+            }
+
+            let body: serde_json::Value = response.json().await?;
+            if let Some(err) = body.get("error") {
+                let code = err
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let info = err
+                    .get("info")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return Err(MwError::Api { code, info });
+            }
             return Ok(body);
         }
     }

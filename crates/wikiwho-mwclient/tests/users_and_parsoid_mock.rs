@@ -249,6 +249,111 @@ async fn fetch_rendered_html_translates_nosuchrevid_to_page_missing() {
     assert!(matches!(err, wikiwho_mwclient::MwError::PageMissing { .. }));
 }
 
+// ---- fetch_revision_text / parse_wikitext mocks ----
+
+async fn revision_text_handler(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let rev_id: u64 = params.get("revids").and_then(|s| s.parse().ok()).unwrap_or(0);
+    Json(json!({
+        "batchcomplete": true,
+        "query": {
+            "pages": [{
+                "pageid": 7,
+                "ns": 0,
+                "title": "Cat",
+                "revisions": [{
+                    "revid": rev_id,
+                    "slots": {
+                        "main": {
+                            "contentmodel": "wikitext",
+                            "contentformat": "text/x-wiki",
+                            "content": "'''Hello''' world from rev {{rev|id}}."
+                        }
+                    }
+                }]
+            }]
+        }
+    }))
+}
+
+async fn revision_text_badrev_handler() -> impl IntoResponse {
+    Json(json!({
+        "query": {
+            "badrevids": {
+                "9999": { "revid": 9999, "missing": true }
+            }
+        }
+    }))
+}
+
+#[tokio::test]
+async fn fetch_revision_text_returns_content() {
+    let app = Router::new().route("/w/api.php", get(revision_text_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = MwClientBuilder::for_api_url(format!("http://{addr}/w/api.php"))
+        .build()
+        .unwrap();
+    let text = client.fetch_revision_text(12345).await.unwrap();
+    assert!(text.starts_with("'''Hello''' world"));
+}
+
+#[tokio::test]
+async fn fetch_revision_text_badrevids_is_page_missing() {
+    let app = Router::new().route("/w/api.php", get(revision_text_badrev_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = MwClientBuilder::for_api_url(format!("http://{addr}/w/api.php"))
+        .build()
+        .unwrap();
+    let err = client.fetch_revision_text(9999).await.unwrap_err();
+    assert!(matches!(err, wikiwho_mwclient::MwError::PageMissing { .. }));
+}
+
+async fn parse_wikitext_post_handler(
+    axum::Form(form): axum::Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    // Sanity-check the form fields we expect.
+    assert_eq!(form.get("action").map(String::as_str), Some("parse"));
+    assert!(form.contains_key("text"), "POST should include text= form field");
+    let echoed = form.get("text").cloned().unwrap_or_default();
+    Json(json!({
+        "parse": {
+            "title": form.get("title").cloned().unwrap_or_default(),
+            "pageid": 0,
+            "text": format!("<div class=\"mw-content-ltr mw-parser-output\">{}</div>", echoed)
+        }
+    }))
+}
+
+#[tokio::test]
+async fn parse_wikitext_posts_text_and_extracts_html() {
+    use axum::routing::post;
+    let app = Router::new().route("/w/api.php", post(parse_wikitext_post_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = MwClientBuilder::for_api_url(format!("http://{addr}/w/api.php"))
+        .build()
+        .unwrap();
+    let html = client
+        .parse_wikitext("Cat", "<span class=\"editor-token token-editor-42\">Hello</span>")
+        .await
+        .unwrap();
+    assert!(html.contains("mw-content-ltr"));
+    assert!(html.contains("token-editor-42"));
+    assert!(html.contains("Hello"));
+}
+
 #[tokio::test]
 async fn fetch_parsoid_html_percent_encodes_title() {
     // Pick a title with characters that require percent-encoding so we
