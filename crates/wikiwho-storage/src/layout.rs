@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 pub const STRINGS_FILE: &str = "strings.bin";
 pub const TOKENS_FILE: &str = "tokens.bin";
 pub const REVISIONS_FILE: &str = "revisions.bin";
+pub const PARAGRAPHS_FILE: &str = "paragraphs.bin";
+pub const SENTENCES_FILE: &str = "sentences.bin";
 pub const HASHTABLES_FILE: &str = "hashtables.bin";
 pub const META_FILE: &str = "meta.json";
 

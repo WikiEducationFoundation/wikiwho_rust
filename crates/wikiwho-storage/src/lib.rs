@@ -15,32 +15,46 @@
 //!   on-disk header carries a `schema_version` so we can layer that
 //!   in without a format break.
 //!
-//! Hash tables (`hashtables.bin`, STORAGE.md §4) are needed at write
-//! time when applying a new revision but not at read time when serving
-//! `rev_content`; the [`reader`] and [`writer`] modules split along
-//! that axis.
+//! The format carries two parallel views of per-revision state:
+//!
+//! - **Flat token sequence** in `revisions.bin` — what the read-hot
+//!   `rev_content` path walks. Cheap and cache-friendly.
+//! - **Paragraph references** in `revisions.bin` + paragraph and
+//!   sentence arenas in `paragraphs.bin` / `sentences.bin` + full
+//!   hash-table back-refs in `hashtables.bin` — what the algorithm's
+//!   resume-from-disk path walks when applying a new revision on top
+//!   of a loaded `Article`.
 //!
 //! Per `CLAUDE.md` the load-bearing test of this crate is the
 //! round-trip parity test: feed a captured-history fixture through
 //! the algorithm, persist via [`writer::write_article`], reload via
 //! [`reader::SnapshotReader`], and verify the resulting
 //! `rev_content` response is byte-identical to the in-memory one.
+//! A second integration test (`resume_from_disk_*`) extends this to
+//! cover the live-update story: load → apply more revisions → match
+//! a single end-to-end in-memory replay.
 
 pub mod codec;
 pub mod hashtables;
 pub mod layout;
 pub mod meta;
+pub mod paragraphs;
 pub mod reader;
 pub mod rebuild;
 pub mod rev_id_index;
 pub mod revisions;
+pub mod sentences;
 pub mod strings;
 pub mod tokens;
 pub mod writer;
 
 /// On-disk schema version. Incremented when a binary file's layout
-/// changes in a way that older readers cannot handle. Currently `1`.
-pub const SCHEMA_VERSION: u16 = 1;
+/// changes in a way that older readers cannot handle. Bumped to `2`
+/// when `paragraphs.bin` + `sentences.bin` landed and
+/// `hashtables.bin` + `revisions.bin` grew arena-back-reference
+/// payloads. No persistent production data has been written at any
+/// earlier version, so the bump is purely tracking the format growth.
+pub const SCHEMA_VERSION: u16 = 2;
 
 /// Errors that can occur reading or writing the on-disk format.
 #[derive(Debug, thiserror::Error)]

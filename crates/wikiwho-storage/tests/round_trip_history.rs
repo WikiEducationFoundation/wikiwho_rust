@@ -49,6 +49,17 @@ fn fixture_root() -> PathBuf {
 }
 
 fn load_fixture(rel: &str) -> Option<(FixtureMeta, Article)> {
+    load_fixture_with_limit(rel, None).map(|(m, a, _)| (m, a))
+}
+
+/// Same as [`load_fixture`] but optionally stops after the first
+/// `limit` history entries. Returns the in-memory `Article` plus the
+/// full vector of history entries so the caller can replay the rest
+/// against a loaded-from-disk Article.
+fn load_fixture_with_limit(
+    rel: &str,
+    limit: Option<usize>,
+) -> Option<(FixtureMeta, Article, Vec<HistoryEntry>)> {
     let dir = fixture_root().join(rel);
     let history_path = dir.join("history.jsonl");
     let meta_path = dir.join("meta.json");
@@ -69,7 +80,8 @@ fn load_fixture(rel: &str) -> Option<(FixtureMeta, Article)> {
 
     let mut article = Article::new(&meta.title);
     article.page_id = Some(meta.page_id);
-    for entry in &entries {
+    let n_to_feed = limit.unwrap_or(entries.len()).min(entries.len());
+    for entry in entries.iter().take(n_to_feed) {
         if entry.text_hidden {
             continue;
         }
@@ -84,7 +96,7 @@ fn load_fixture(rel: &str) -> Option<(FixtureMeta, Article)> {
             user_name: entry.user_name.clone(),
         });
     }
-    Some((meta, article))
+    Some((meta, article, entries))
 }
 
 /// Persist + reload + verify wire format equals.
@@ -139,6 +151,115 @@ fn round_trip_simple_27263() {
 fn round_trip_en_24544_photosynthesis() {
     // Photosynthesis — 5.5k revs, exercises full-history scale.
     run_round_trip("en/24544/1354638187");
+}
+
+/// The load-bearing resume-from-disk test: replay the first `N` revs
+/// in memory, persist, reload, then apply the remaining `K` revs on
+/// top of the loaded Article. Compare against a single end-to-end
+/// in-memory replay of all `N+K` revs. The two should produce
+/// identical wire-format output for the target revision and
+/// identical token / paragraph / sentence arenas.
+///
+/// Without paragraph/sentence persistence this test would fail —
+/// `analyse_revision` walks paragraphs_ht for hash-level matching
+/// and the loaded arena ids point at empty paragraphs/sentences.
+fn run_resume_from_disk(rel: &str, split_at: usize) {
+    let Some((meta, _full_article, entries)) = load_fixture_with_limit(rel, None) else {
+        return;
+    };
+    let language = meta.lang.clone();
+    let page_id = meta.page_id;
+    let target_rev = meta.rev_id;
+
+    // First: replay everything in memory as the reference.
+    let Some((_, full_article, _)) = load_fixture_with_limit(rel, None) else {
+        return;
+    };
+
+    // Second: replay only the first `split_at` revs, persist, reload,
+    // apply the remainder.
+    let Some((_, mut partial, _)) = load_fixture_with_limit(rel, Some(split_at)) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    write_article(&partial, tmp.path(), &language).expect("write_article");
+    let reader = SnapshotReader::open(tmp.path(), &language, page_id).expect("reload");
+    partial = reader.article;
+
+    for entry in entries.iter().skip(split_at) {
+        if entry.text_hidden {
+            continue;
+        }
+        partial.analyse_revision(RevisionInput {
+            rev_id: entry.rev_id,
+            timestamp: entry.timestamp.clone(),
+            text: entry.text.clone(),
+            sha1: entry.sha1.clone(),
+            comment: entry.comment.clone(),
+            minor: entry.minor,
+            user_id: entry.user_id,
+            user_name: entry.user_name.clone(),
+        });
+    }
+
+    // Compare wire-format on the target rev (covers token-level
+    // attribution).
+    let want = build_rev_content(&full_article, &[target_rev], ResponseParameters::ALL).unwrap();
+    let got = build_rev_content(&partial, &[target_rev], ResponseParameters::ALL).unwrap();
+    assert_eq!(
+        serde_json::to_string(&want).unwrap(),
+        serde_json::to_string(&got).unwrap(),
+        "wire-format diverged for {rel} (split_at={split_at}, target={target_rev})"
+    );
+
+    // Compare structural counters too — these would catch divergence
+    // in arena allocation or hash-table state that didn't make it
+    // into the final wire format on this rev.
+    assert_eq!(
+        partial.tokens.len(),
+        full_article.tokens.len(),
+        "token arena size diverged"
+    );
+    assert_eq!(
+        partial.paragraphs_ht.len(),
+        full_article.paragraphs_ht.len(),
+        "paragraphs_ht size diverged"
+    );
+    assert_eq!(
+        partial.sentences_ht.len(),
+        full_article.sentences_ht.len(),
+        "sentences_ht size diverged"
+    );
+    assert_eq!(
+        partial.spam_ids,
+        full_article.spam_ids,
+        "spam_ids diverged"
+    );
+    assert_eq!(
+        partial.ordered_revisions,
+        full_article.ordered_revisions,
+        "ordered_revisions diverged"
+    );
+}
+
+#[test]
+fn resume_from_disk_zh() {
+    // Split a 7-rev fixture: persist after rev 3, apply rev 4-7.
+    run_resume_from_disk("zh/1686258/64806634", 3);
+}
+
+#[test]
+fn resume_from_disk_simple_27263() {
+    // 3.8k revs; persist after rev 1000, apply the remaining ~2783.
+    // Exercises the high-vandalism path where spam_ids/spam_hashes
+    // round-trip is load-bearing.
+    run_resume_from_disk("simple/27263/10855732", 1000);
+}
+
+#[test]
+fn resume_from_disk_photosynthesis() {
+    // 5.5k revs; persist after rev 2000.
+    run_resume_from_disk("en/24544/1354638187", 2000);
 }
 
 /// Verify that ALL revisions in the fixture (not just the target)

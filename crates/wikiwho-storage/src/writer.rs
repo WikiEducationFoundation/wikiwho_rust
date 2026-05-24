@@ -26,11 +26,16 @@ use std::path::{Path, PathBuf};
 
 use wikiwho_attribute::structures::{Article, iter_rev_tokens};
 
-use crate::hashtables::HashTables;
-use crate::layout::{article_dir, HASHTABLES_FILE, META_FILE, REVISIONS_FILE, STRINGS_FILE, TOKENS_FILE};
+use crate::hashtables::{HashBucket, HashTables};
+use crate::layout::{
+    article_dir, HASHTABLES_FILE, META_FILE, PARAGRAPHS_FILE, REVISIONS_FILE, SENTENCES_FILE,
+    STRINGS_FILE, TOKENS_FILE,
+};
 use crate::meta::Meta;
+use crate::paragraphs::{write_paragraphs, StoredOrderedSentence, StoredParagraph};
 use crate::rev_id_index::RevIdIndex;
-use crate::revisions::{write_revisions, StoredRevision};
+use crate::revisions::{write_revisions, StoredOrderedParagraph, StoredRevision};
+use crate::sentences::{write_sentences, StoredSentence};
 use crate::strings::write_strings;
 use crate::tokens::{write_tokens, StoredToken};
 use crate::{Result, StorageError};
@@ -48,12 +53,16 @@ pub fn write_article(article: &Article, volume: &Path, language: &str) -> Result
 
     let (strings, tokens) = project_tokens(article);
     let revisions = project_revisions(article);
+    let paragraphs = project_paragraphs(article);
+    let sentences = project_sentences(article);
     let hashtables = project_hashtables(article);
     let meta = project_meta(article, language);
 
     write_strings_file(&dir, &strings)?;
     write_tokens_file(&dir, &tokens)?;
     write_revisions_file(&dir, &revisions)?;
+    write_paragraphs_file(&dir, &paragraphs)?;
+    write_sentences_file(&dir, &sentences)?;
     write_hashtables_file(&dir, &hashtables)?;
     write_meta_file(&dir, &meta)?;
 
@@ -101,6 +110,13 @@ fn project_tokens<'a>(article: &'a Article) -> (Vec<&'a str>, Vec<StoredToken>) 
 
 /// Project every stored revision into the on-disk shape, in
 /// processing order (`article.ordered_revisions`).
+///
+/// For each revision we capture both the flat `token_sequence` (the
+/// read-hot path) and the per-rev `ordered_paragraphs` list (the
+/// resume-from-disk path). The two are derived from the same in-memory
+/// state — `Revision::paragraphs` + `Revision::ordered_paragraphs` —
+/// but live in different files because they're consumed by different
+/// callers.
 fn project_revisions(article: &Article) -> Vec<StoredRevision> {
     article
         .ordered_revisions
@@ -108,37 +124,124 @@ fn project_revisions(article: &Article) -> Vec<StoredRevision> {
         .filter_map(|rev_id| {
             article.revisions.get(rev_id).map(|rev| {
                 let sequence = iter_rev_tokens(article, rev);
+                let ordered_paragraphs = project_rev_ordered_paragraphs(rev);
                 StoredRevision {
                     rev_id: rev.id,
                     timestamp: rev.timestamp.clone(),
                     editor: rev.editor.clone(),
+                    length: rev.length as u64,
+                    original_adds: rev.original_adds,
                     token_sequence: sequence,
+                    ordered_paragraphs,
                 }
             })
         })
         .collect()
 }
 
-/// Pull paragraph + sentence hash sets out of the cross-revision
-/// hash tables.
+/// Walk a revision's `ordered_paragraphs` (hash list) and pair each
+/// position with the matching paragraph_id from `revision.paragraphs`.
+/// Same disambiguation logic as `iter_rev_tokens`: when a hash appears
+/// N>1 times in the ordered list, the N entries in
+/// `revision.paragraphs[hash]` correspond 1:1 in order.
+fn project_rev_ordered_paragraphs(
+    rev: &wikiwho_attribute::structures::Revision,
+) -> Vec<StoredOrderedParagraph> {
+    let mut seen_count: HashMap<&str, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(rev.ordered_paragraphs.len());
+    for hash in &rev.ordered_paragraphs {
+        let n = seen_count.entry(hash.as_str()).or_insert(0);
+        let pid = rev
+            .paragraphs
+            .get(hash)
+            .and_then(|v| v.get(*n).copied())
+            .unwrap_or_default();
+        *n += 1;
+        out.push(StoredOrderedParagraph {
+            hash: hash.clone(),
+            paragraph_id: pid,
+        });
+    }
+    out
+}
+
+/// Project the paragraph arena into [`StoredParagraph`] records. Each
+/// paragraph's `sentences` map is flattened into `ordered_sentences`
+/// (the in-memory map is derivable from the ordered list at read
+/// time).
+fn project_paragraphs(article: &Article) -> Vec<StoredParagraph> {
+    article
+        .paragraphs
+        .iter()
+        .map(|p| {
+            let mut seen_count: HashMap<&str, usize> = HashMap::new();
+            let mut ordered_sentences = Vec::with_capacity(p.ordered_sentences.len());
+            for hash in &p.ordered_sentences {
+                let n = seen_count.entry(hash.as_str()).or_insert(0);
+                let sid = p
+                    .sentences
+                    .get(hash)
+                    .and_then(|v| v.get(*n).copied())
+                    .unwrap_or_default();
+                *n += 1;
+                ordered_sentences.push(StoredOrderedSentence {
+                    hash: hash.clone(),
+                    sentence_id: sid,
+                });
+            }
+            StoredParagraph {
+                hash_value: p.hash_value.clone(),
+                value: p.value.clone(),
+                ordered_sentences,
+            }
+        })
+        .collect()
+}
+
+/// Project the sentence arena into [`StoredSentence`] records.
+fn project_sentences(article: &Article) -> Vec<StoredSentence> {
+    article
+        .sentences
+        .iter()
+        .map(|s| StoredSentence {
+            hash_value: s.hash_value.clone(),
+            value: s.value.clone(),
+            words: s.words.clone(),
+        })
+        .collect()
+}
+
+/// Pull the cross-revision hash tables out of the article.
+///
+/// Each bucket carries the **full list of arena ids** that share that
+/// hash — the algorithm's resume-from-disk path looks up paragraphs /
+/// sentences by hash via these tables and the matching
+/// [`StoredParagraph`] / [`StoredSentence`] records. Entries are sorted
+/// by hash for deterministic on-disk output.
 fn project_hashtables(article: &Article) -> HashTables {
-    let mut paragraph_hashes: Vec<(String, u64)> = article
+    let mut paragraph_buckets: Vec<HashBucket> = article
         .paragraphs_ht
         .iter()
-        .map(|(h, occurrences)| (h.clone(), occurrences.len() as u64))
+        .map(|(h, ids)| HashBucket {
+            hash: h.clone(),
+            arena_ids: ids.clone(),
+        })
         .collect();
-    paragraph_hashes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    paragraph_buckets.sort_unstable_by(|a, b| a.hash.cmp(&b.hash));
 
-    let mut sentence_hashes: Vec<(String, u64)> = article
+    let mut sentence_buckets: Vec<HashBucket> = article
         .sentences_ht
         .iter()
-        .map(|(h, occurrences)| (h.clone(), occurrences.len() as u64))
+        .map(|(h, ids)| HashBucket {
+            hash: h.clone(),
+            arena_ids: ids.clone(),
+        })
         .collect();
-    sentence_hashes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    sentence_buckets.sort_unstable_by(|a, b| a.hash.cmp(&b.hash));
 
     HashTables {
-        paragraph_hashes,
-        sentence_hashes,
+        paragraph_buckets,
+        sentence_buckets,
     }
 }
 
@@ -149,6 +252,8 @@ fn project_meta(article: &Article, language: &str) -> Meta {
         .get(&last_revid)
         .map(|r| r.timestamp.clone())
         .unwrap_or_default();
+    let mut spam_hashes: Vec<String> = article.spam_hashes.iter().cloned().collect();
+    spam_hashes.sort_unstable();
     Meta {
         schema_version: crate::SCHEMA_VERSION,
         page_id: article.page_id.unwrap_or(0),
@@ -161,6 +266,8 @@ fn project_meta(article: &Article, language: &str) -> Meta {
         n_lifetime_tokens: article.tokens.len() as u64,
         n_spam_revisions: article.spam_ids.len() as u64,
         next_token_id: article.next_token_id,
+        spam_revisions: article.spam_ids.clone(),
+        spam_hashes,
     }
 }
 
@@ -188,6 +295,26 @@ fn write_revisions_file(dir: &Path, revisions: &[StoredRevision]) -> Result<()> 
     let path = dir.join(REVISIONS_FILE);
     let mut w = BufWriter::new(File::create(path)?);
     write_revisions(&mut w, revisions)?;
+    w.into_inner()
+        .map_err(|e| StorageError::Io(e.into_error()))?
+        .sync_all()?;
+    Ok(())
+}
+
+fn write_paragraphs_file(dir: &Path, paragraphs: &[StoredParagraph]) -> Result<()> {
+    let path = dir.join(PARAGRAPHS_FILE);
+    let mut w = BufWriter::new(File::create(path)?);
+    write_paragraphs(&mut w, paragraphs)?;
+    w.into_inner()
+        .map_err(|e| StorageError::Io(e.into_error()))?
+        .sync_all()?;
+    Ok(())
+}
+
+fn write_sentences_file(dir: &Path, sentences: &[StoredSentence]) -> Result<()> {
+    let path = dir.join(SENTENCES_FILE);
+    let mut w = BufWriter::new(File::create(path)?);
+    write_sentences(&mut w, sentences)?;
     w.into_inner()
         .map_err(|e| StorageError::Io(e.into_error()))?
         .sync_all()?;

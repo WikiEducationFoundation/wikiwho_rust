@@ -1,35 +1,43 @@
 //! Load an on-disk blob back into an in-memory [`Article`].
 //!
 //! Inverse of [`crate::writer::write_article`]. The reconstructed
-//! `Article` has enough state to serve `rev_content` via
-//! [`wikiwho_attribute::response::build_rev_content`]:
+//! `Article` is fully ready for the algorithm to resume from disk —
+//! every field that `Article::analyse_revision` reads is populated:
 //!
 //! - `tokens` arena (from `tokens.bin` + `strings.bin`).
-//! - `revisions` map keyed by rev_id, each with `token_sequence_override`
-//!   populated so `iter_rev_tokens` returns the persisted sequence
-//!   without walking paragraph/sentence arenas.
-//! - `ordered_revisions` in the original processing order (so the
-//!   two-rev range form of `rev_content` works).
-//! - `paragraphs_ht` and `sentences_ht` populated as hash → empty
-//!   `Vec` since we don't yet persist back-references. These are
-//!   informational only on the read path; the algorithm-resume path
-//!   that needs them is deferred.
-//!
-//! The paragraph and sentence arenas stay empty — they're not
-//! persisted and `iter_rev_tokens` won't be asked to walk them
-//! thanks to the override field.
+//! - `paragraphs` and `sentences` arenas (from `paragraphs.bin` +
+//!   `sentences.bin`).
+//! - `paragraphs_ht` and `sentences_ht` with full hash → arena id
+//!   buckets (from `hashtables.bin`).
+//! - `revisions` map keyed by rev_id, each with:
+//!   - `paragraphs` (HashMap<Hash, Vec<ParagraphId>>) +
+//!     `ordered_paragraphs` (Vec<Hash>) rebuilt from the per-rev
+//!     ordered list in `revisions.bin`.
+//!   - `length`, `original_adds`, `editor`, `timestamp`.
+//!   - `token_sequence_override` populated as a fast path for
+//!     `iter_rev_tokens` — the algorithm-side walk through paragraphs
+//!     → sentences → words would still work because the arenas are
+//!     present, but the override keeps `rev_content` cheap.
+//! - `ordered_revisions`, `last_good_rev_id`, `spam_ids`,
+//!   `spam_hashes`, `next_token_id` from `meta.json`.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use wikiwho_attribute::structures::{Article, Word};
+use wikiwho_attribute::structures::{
+    Article, Paragraph, ParagraphId, Revision, Sentence, SentenceId, Word,
+};
 
 use crate::hashtables::{parse_hashtables_blob, HashTables};
 use crate::layout::{
-    article_dir, HASHTABLES_FILE, META_FILE, REVISIONS_FILE, STRINGS_FILE, TOKENS_FILE,
+    article_dir, HASHTABLES_FILE, META_FILE, PARAGRAPHS_FILE, REVISIONS_FILE, SENTENCES_FILE,
+    STRINGS_FILE, TOKENS_FILE,
 };
 use crate::meta::Meta;
+use crate::paragraphs::parse_paragraphs_blob;
 use crate::revisions::parse_revisions_blob;
+use crate::sentences::parse_sentences_blob;
 use crate::strings::parse_strings_blob;
 use crate::tokens::parse_tokens_blob;
 use crate::{Result, StorageError, SCHEMA_VERSION};
@@ -68,11 +76,15 @@ impl SnapshotReader {
         let strings_bytes = fs::read(dir.join(STRINGS_FILE))?;
         let tokens_bytes = fs::read(dir.join(TOKENS_FILE))?;
         let revisions_bytes = fs::read(dir.join(REVISIONS_FILE))?;
+        let paragraphs_bytes = fs::read(dir.join(PARAGRAPHS_FILE))?;
+        let sentences_bytes = fs::read(dir.join(SENTENCES_FILE))?;
         let hashtables_bytes = fs::read(dir.join(HASHTABLES_FILE))?;
 
         let strings = parse_strings_blob(&strings_bytes)?;
         let stored_tokens = parse_tokens_blob(&tokens_bytes)?;
         let stored_revisions = parse_revisions_blob(&revisions_bytes)?;
+        let stored_paragraphs = parse_paragraphs_blob(&paragraphs_bytes)?;
+        let stored_sentences = parse_sentences_blob(&sentences_bytes)?;
         let hashtables = parse_hashtables_blob(&hashtables_bytes)?;
 
         // Re-hydrate the Article. Field-for-field:
@@ -80,7 +92,7 @@ impl SnapshotReader {
         article.page_id = Some(meta.page_id);
         article.next_token_id = meta.next_token_id;
 
-        // Token arena (paragraph/sentence arenas stay empty).
+        // Token arena.
         article.tokens.reserve_exact(stored_tokens.len());
         for (id, st) in stored_tokens.iter().enumerate() {
             let value = strings
@@ -104,31 +116,85 @@ impl SnapshotReader {
             });
         }
 
-        // Revisions map + ordered list. revisions.bin returns
-        // processing order; that's what we want.
+        // Sentence arena. The `sentences` map on each `Paragraph` is
+        // rebuilt below by grouping the `ordered_sentences` list, not
+        // stored explicitly.
+        article.sentences.reserve_exact(stored_sentences.len());
+        for s in &stored_sentences {
+            article.sentences.push(Sentence {
+                hash_value: s.hash_value.clone(),
+                value: s.value.clone(),
+                words: s.words.clone(),
+            });
+        }
+
+        // Paragraph arena. For each stored paragraph, rebuild the
+        // `sentences: HashMap<Hash, Vec<SentenceId>>` map by walking
+        // `ordered_sentences` and grouping repeated hashes — the
+        // exact inverse of `project_paragraphs` in the writer.
+        article.paragraphs.reserve_exact(stored_paragraphs.len());
+        for p in &stored_paragraphs {
+            let mut sentences_by_hash: HashMap<String, Vec<SentenceId>> = HashMap::new();
+            let mut ordered_sentences: Vec<String> =
+                Vec::with_capacity(p.ordered_sentences.len());
+            for entry in &p.ordered_sentences {
+                sentences_by_hash
+                    .entry(entry.hash.clone())
+                    .or_default()
+                    .push(entry.sentence_id);
+                ordered_sentences.push(entry.hash.clone());
+            }
+            article.paragraphs.push(Paragraph {
+                hash_value: p.hash_value.clone(),
+                value: p.value.clone(),
+                sentences: sentences_by_hash,
+                ordered_sentences,
+            });
+        }
+
+        // Cross-revision hash tables: full arena-id buckets.
+        for b in &hashtables.paragraph_buckets {
+            article
+                .paragraphs_ht
+                .insert(b.hash.clone(), b.arena_ids.clone());
+        }
+        for b in &hashtables.sentence_buckets {
+            article
+                .sentences_ht
+                .insert(b.hash.clone(), b.arena_ids.clone());
+        }
+
+        // Revisions map + ordered list. Each revision rehydrates with
+        // both the paragraph references (the resume path) and the
+        // flat token sequence (the read-hot path).
         for rev in &stored_revisions {
-            let r = wikiwho_attribute::structures::Revision {
+            let mut paragraphs_by_hash: HashMap<String, Vec<ParagraphId>> = HashMap::new();
+            let mut ordered_paragraphs: Vec<String> =
+                Vec::with_capacity(rev.ordered_paragraphs.len());
+            for entry in &rev.ordered_paragraphs {
+                paragraphs_by_hash
+                    .entry(entry.hash.clone())
+                    .or_default()
+                    .push(entry.paragraph_id);
+                ordered_paragraphs.push(entry.hash.clone());
+            }
+            let r = Revision {
                 id: rev.rev_id,
                 editor: rev.editor.clone(),
                 timestamp: rev.timestamp.clone(),
+                length: rev.length as usize,
+                original_adds: rev.original_adds,
+                paragraphs: paragraphs_by_hash,
+                ordered_paragraphs,
                 token_sequence_override: Some(rev.token_sequence.clone()),
-                ..Default::default()
             };
             article.ordered_revisions.push(rev.rev_id);
             article.revisions.insert(rev.rev_id, r);
         }
 
-        // last_good_rev_id from meta (mirrors what the writer recorded).
         article.last_good_rev_id = meta.last_processed_revid;
-
-        // Cross-revision hash tables: hash set membership only, no
-        // arena back-references yet (see writer + hashtables.rs).
-        for (h, _count) in &hashtables.paragraph_hashes {
-            article.paragraphs_ht.insert(h.clone(), Vec::new());
-        }
-        for (h, _count) in &hashtables.sentence_hashes {
-            article.sentences_ht.insert(h.clone(), Vec::new());
-        }
+        article.spam_ids = meta.spam_revisions.clone();
+        article.spam_hashes = meta.spam_hashes.iter().cloned().collect();
 
         Ok(Self {
             meta,
@@ -239,6 +305,89 @@ mod tests {
         assert_eq!(reader.meta.n_lifetime_tokens, article.tokens.len() as u64);
     }
 
+    /// The reader populates every Article field that
+    /// `analyse_revision` reads — so the loaded Article is
+    /// resume-from-disk ready, not just rev_content-serving ready.
+    #[test]
+    fn round_trip_preserves_full_article_state() {
+        let article = fixture_article();
+        let tmp = tempfile::tempdir().unwrap();
+        crate::writer::write_article(&article, tmp.path(), "en").unwrap();
+        let reader = SnapshotReader::open(tmp.path(), "en", 7).unwrap();
+        let loaded = &reader.article;
+
+        // Arena sizes.
+        assert_eq!(loaded.tokens.len(), article.tokens.len());
+        assert_eq!(loaded.sentences.len(), article.sentences.len());
+        assert_eq!(loaded.paragraphs.len(), article.paragraphs.len());
+
+        // Token arena field-by-field.
+        for (i, w) in article.tokens.iter().enumerate() {
+            let l = &loaded.tokens[i];
+            assert_eq!(l.value, w.value, "token {i} value");
+            assert_eq!(l.origin_rev_id, w.origin_rev_id, "token {i} origin");
+            assert_eq!(l.last_rev_id, w.last_rev_id, "token {i} last");
+            assert_eq!(l.inbound, w.inbound, "token {i} inbound");
+            assert_eq!(l.outbound, w.outbound, "token {i} outbound");
+        }
+
+        // Sentence arena.
+        for (i, s) in article.sentences.iter().enumerate() {
+            let l = &loaded.sentences[i];
+            assert_eq!(l.hash_value, s.hash_value, "sentence {i} hash");
+            assert_eq!(l.value, s.value, "sentence {i} value");
+            assert_eq!(l.words, s.words, "sentence {i} words");
+        }
+
+        // Paragraph arena. The `sentences` HashMap is reconstructed by
+        // grouping `ordered_sentences`; compare by sorted (hash, ids)
+        // pairs to avoid relying on HashMap iteration order.
+        for (i, p) in article.paragraphs.iter().enumerate() {
+            let l = &loaded.paragraphs[i];
+            assert_eq!(l.hash_value, p.hash_value, "paragraph {i} hash");
+            assert_eq!(l.value, p.value, "paragraph {i} value");
+            assert_eq!(l.ordered_sentences, p.ordered_sentences, "paragraph {i} ordered");
+            for (h, ids) in &p.sentences {
+                assert_eq!(l.sentences.get(h), Some(ids), "paragraph {i} sentences[{h}]");
+            }
+            assert_eq!(l.sentences.len(), p.sentences.len(), "paragraph {i} sentences map size");
+        }
+
+        // Cross-revision hash tables.
+        for (h, ids) in &article.paragraphs_ht {
+            assert_eq!(loaded.paragraphs_ht.get(h), Some(ids), "paragraphs_ht[{h}]");
+        }
+        assert_eq!(loaded.paragraphs_ht.len(), article.paragraphs_ht.len());
+        for (h, ids) in &article.sentences_ht {
+            assert_eq!(loaded.sentences_ht.get(h), Some(ids), "sentences_ht[{h}]");
+        }
+        assert_eq!(loaded.sentences_ht.len(), article.sentences_ht.len());
+
+        // Per-revision state.
+        assert_eq!(loaded.ordered_revisions, article.ordered_revisions);
+        for (rev_id, rev) in &article.revisions {
+            let l = loaded
+                .revisions
+                .get(rev_id)
+                .unwrap_or_else(|| panic!("missing rev {rev_id}"));
+            assert_eq!(l.editor, rev.editor, "rev {rev_id} editor");
+            assert_eq!(l.timestamp, rev.timestamp, "rev {rev_id} ts");
+            assert_eq!(l.length, rev.length, "rev {rev_id} length");
+            assert_eq!(l.original_adds, rev.original_adds, "rev {rev_id} adds");
+            assert_eq!(l.ordered_paragraphs, rev.ordered_paragraphs, "rev {rev_id} ordered");
+            for (h, ids) in &rev.paragraphs {
+                assert_eq!(l.paragraphs.get(h), Some(ids), "rev {rev_id} paragraphs[{h}]");
+            }
+            assert_eq!(l.paragraphs.len(), rev.paragraphs.len(), "rev {rev_id} paragraphs len");
+        }
+
+        // Spam + counters.
+        assert_eq!(loaded.last_good_rev_id, article.last_good_rev_id);
+        assert_eq!(loaded.next_token_id, article.next_token_id);
+        assert_eq!(loaded.spam_ids, article.spam_ids);
+        assert_eq!(loaded.spam_hashes, article.spam_hashes);
+    }
+
     #[test]
     fn hashtables_round_trip_hashes() {
         let article = fixture_article();
@@ -246,26 +395,24 @@ mod tests {
         crate::writer::write_article(&article, tmp.path(), "en").unwrap();
         let reader = SnapshotReader::open(tmp.path(), "en", 7).unwrap();
         // Every paragraph hash the algorithm produced should be in the
-        // loaded hash table.
-        for h in article.paragraphs_ht.keys() {
-            assert!(
-                reader
-                    .hashtables
-                    .paragraph_hashes
-                    .iter()
-                    .any(|(s, _)| s == h),
-                "missing paragraph hash {h}"
-            );
+        // loaded hash table — and the bucket should match arena ids.
+        for (h, ids) in &article.paragraphs_ht {
+            let bucket = reader
+                .hashtables
+                .paragraph_buckets
+                .iter()
+                .find(|b| &b.hash == h)
+                .unwrap_or_else(|| panic!("missing paragraph hash {h}"));
+            assert_eq!(&bucket.arena_ids, ids, "paragraph bucket mismatch for {h}");
         }
-        for h in article.sentences_ht.keys() {
-            assert!(
-                reader
-                    .hashtables
-                    .sentence_hashes
-                    .iter()
-                    .any(|(s, _)| s == h),
-                "missing sentence hash {h}"
-            );
+        for (h, ids) in &article.sentences_ht {
+            let bucket = reader
+                .hashtables
+                .sentence_buckets
+                .iter()
+                .find(|b| &b.hash == h)
+                .unwrap_or_else(|| panic!("missing sentence hash {h}"));
+            assert_eq!(&bucket.arena_ids, ids, "sentence bucket mismatch for {h}");
         }
     }
 }

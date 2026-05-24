@@ -22,10 +22,21 @@
 //!   processing from disk we'll fold this into `appendlog.bin` or a
 //!   separate header.
 //! - **Token sequence is stored explicitly per revision.** This is what
-//!   replaces the `paragraphs → sentences → words` walk; without it
-//!   the read side would need `paragraphs.bin` / `sentences.bin` files
-//!   too. The cost is bounded — one varint per token, delta-encoded
-//!   within the revision — and it's the read-hot path.
+//!   keeps the `rev_content` path cheap — one mmap'd varint stream
+//!   per rev instead of a paragraphs → sentences → words walk. The
+//!   cost is bounded (one varint per token, delta-encoded within the
+//!   revision).
+//! - **Paragraph references are also stored per revision.** Each rev
+//!   records its `ordered_paragraphs` (hash + arena id pairs in
+//!   document order). The algorithm's resume-from-disk path uses
+//!   these — combined with [`crate::paragraphs::StoredParagraph`] and
+//!   the cross-revision [`crate::hashtables::HashTables`] — to
+//!   rebuild [`Revision::paragraphs`] +
+//!   [`Revision::ordered_paragraphs`] when applying a new revision
+//!   on top of a loaded `Article`. This is in addition to (not in
+//!   place of) the token sequence: the two coexist because the
+//!   read-hot path (serving `rev_content`) shouldn't have to walk
+//!   paragraphs.
 //!
 //! Layout:
 //!
@@ -44,9 +55,15 @@
 //!     varint u64:    rev_id (absolute)
 //!     varint u64:    timestamp length, then UTF-8 bytes
 //!     varint u64:    editor length, then UTF-8 bytes
+//!     varint u64:    length (chars, not bytes), per Revision::length
+//!     varint u64:    original_adds, per Revision::original_adds
 //!     varint u64:    n_tokens
 //!     varint zigzag × n_tokens: token ids, delta-encoded within rev
 //!                    (first token: delta from 0, subsequent: from prev)
+//!     varint u64:    n_ordered_paragraphs
+//!     for each entry in document order:
+//!       varint u64:  paragraph_hash length, then UTF-8 bytes
+//!       varint zigzag: paragraph_id delta (from prev, first from 0)
 //!
 //! revision-id index table (12 × n_revisions bytes, sorted by rev_id):
 //!     u64 BE         rev_id
@@ -73,15 +90,37 @@ pub const MAGIC_HEAD: &[u8; 4] = b"WWRV";
 pub const MAGIC_TAIL: &[u8; 4] = b"VRWW";
 const FILE_NAME: &str = "revisions.bin";
 
-/// In-memory shape of one persisted revision. `token_sequence` is the
-/// flat ordered list of token ids in the revision, as the wire format
-/// emits them.
+/// In-memory shape of one persisted revision.
+///
+/// - `token_sequence` is the flat ordered list of token ids the wire
+///   format emits — what the read-hot `rev_content` path consumes.
+/// - `ordered_paragraphs` is the per-rev paragraph reference list
+///   (hash + arena id pairs in document order) the resume-from-disk
+///   path uses to rebuild
+///   [`wikiwho_attribute::structures::Revision::paragraphs`] /
+///   [`Revision::ordered_paragraphs`] without re-replaying history.
+/// - `length` and `original_adds` mirror their `Revision` fields and
+///   feed the length-shrink vandalism heuristic when a new rev is
+///   applied on top of a loaded `Article`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredRevision {
     pub rev_id: u64,
     pub timestamp: String,
     pub editor: String,
+    pub length: u64,
+    pub original_adds: u32,
     pub token_sequence: Vec<u32>,
+    pub ordered_paragraphs: Vec<StoredOrderedParagraph>,
+}
+
+/// One entry in a revision's `ordered_paragraphs` list — paragraph
+/// hash + paragraph-arena id pair. The hash is what the algorithm
+/// looks up against `paragraphs_ht`; the arena id is what indexes
+/// into [`crate::paragraphs::StoredParagraph`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOrderedParagraph {
+    pub hash: String,
+    pub paragraph_id: u32,
 }
 
 /// Write the revision section + index table.
@@ -112,6 +151,8 @@ pub fn write_revisions<W: Write>(w: &mut W, revisions: &[StoredRevision]) -> Res
         data_section.extend_from_slice(rev.timestamp.as_bytes());
         write_varint_u64(&mut data_section, rev.editor.len() as u64)?;
         data_section.extend_from_slice(rev.editor.as_bytes());
+        write_varint_u64(&mut data_section, rev.length)?;
+        write_varint_u64(&mut data_section, rev.original_adds as u64)?;
 
         write_varint_u64(&mut data_section, rev.token_sequence.len() as u64)?;
         let mut prev: i64 = 0;
@@ -119,6 +160,16 @@ pub fn write_revisions<W: Write>(w: &mut W, revisions: &[StoredRevision]) -> Res
             let delta = tid as i64 - prev;
             write_varint_i64(&mut data_section, delta)?;
             prev = tid as i64;
+        }
+
+        write_varint_u64(&mut data_section, rev.ordered_paragraphs.len() as u64)?;
+        let mut prev_pid: i64 = 0;
+        for op in &rev.ordered_paragraphs {
+            write_varint_u64(&mut data_section, op.hash.len() as u64)?;
+            data_section.extend_from_slice(op.hash.as_bytes());
+            let delta = op.paragraph_id as i64 - prev_pid;
+            write_varint_i64(&mut data_section, delta)?;
+            prev_pid = op.paragraph_id as i64;
         }
     }
 
@@ -244,6 +295,15 @@ fn read_one_revision(cur: &mut std::io::Cursor<&[u8]>) -> Result<StoredRevision>
     let timestamp = read_utf8(cur, ts_len, "timestamp")?;
     let ed_len = read_varint_u64(cur, FILE_NAME)? as usize;
     let editor = read_utf8(cur, ed_len, "editor")?;
+    let length = read_varint_u64(cur, FILE_NAME)?;
+    let original_adds = read_varint_u64(cur, FILE_NAME)?;
+    if original_adds > u32::MAX as u64 {
+        return Err(StorageError::Malformed {
+            file: FILE_NAME,
+            detail: format!("original_adds {original_adds} exceeds u32::MAX"),
+        });
+    }
+    let original_adds = original_adds as u32;
     let n_tokens = read_varint_u64(cur, FILE_NAME)? as usize;
 
     let mut token_sequence = Vec::with_capacity(n_tokens);
@@ -261,11 +321,35 @@ fn read_one_revision(cur: &mut std::io::Cursor<&[u8]>) -> Result<StoredRevision>
         prev = v;
     }
 
+    let n_paragraphs = read_varint_u64(cur, FILE_NAME)? as usize;
+    let mut ordered_paragraphs = Vec::with_capacity(n_paragraphs);
+    let mut prev_pid: i64 = 0;
+    for _ in 0..n_paragraphs {
+        let hlen = read_varint_u64(cur, FILE_NAME)? as usize;
+        let hash = read_utf8(cur, hlen, "paragraph_hash")?;
+        let delta = read_varint_i64(cur, FILE_NAME)?;
+        let v = prev_pid + delta;
+        if !(0..=u32::MAX as i64).contains(&v) {
+            return Err(StorageError::Malformed {
+                file: FILE_NAME,
+                detail: format!("paragraph_id out of u32 range: {v}"),
+            });
+        }
+        ordered_paragraphs.push(StoredOrderedParagraph {
+            hash,
+            paragraph_id: v as u32,
+        });
+        prev_pid = v;
+    }
+
     Ok(StoredRevision {
         rev_id,
         timestamp,
         editor,
+        length,
+        original_adds,
         token_sequence,
+        ordered_paragraphs,
     })
 }
 
@@ -391,13 +475,24 @@ mod tests {
                 rev_id: 1000,
                 timestamp: "2024-01-01T00:00:00Z".into(),
                 editor: "42".into(),
+                length: 25,
+                original_adds: 4,
                 token_sequence: vec![0, 1, 2, 3],
+                ordered_paragraphs: vec![
+                    StoredOrderedParagraph { hash: "hp0".into(), paragraph_id: 0 },
+                ],
             },
             StoredRevision {
                 rev_id: 2000,
                 timestamp: "2024-01-02T00:00:00Z".into(),
                 editor: "0|192.0.2.1".into(),
+                length: 30,
+                original_adds: 1,
                 token_sequence: vec![0, 1, 5, 2, 3],
+                ordered_paragraphs: vec![
+                    StoredOrderedParagraph { hash: "hp0".into(), paragraph_id: 0 },
+                    StoredOrderedParagraph { hash: "hp1".into(), paragraph_id: 1 },
+                ],
             },
             // Out-of-order in processing order but the index table
             // will sort it.
@@ -405,7 +500,10 @@ mod tests {
                 rev_id: 1500,
                 timestamp: "2024-01-03T00:00:00Z".into(),
                 editor: "".into(),
+                length: 0,
+                original_adds: 0,
                 token_sequence: vec![],
+                ordered_paragraphs: vec![],
             },
         ]
     }
@@ -484,7 +582,15 @@ mod tests {
                 rev_id: i * 100,
                 timestamp: format!("2024-01-{:02}T00:00:{:02}Z", (i % 28) + 1, i % 60),
                 editor: i.to_string(),
+                length: 100 + i,
+                original_adds: (i % 13) as u32,
                 token_sequence: (0u32..(i as u32 % 50)).collect(),
+                ordered_paragraphs: (0u32..(i as u32 % 5))
+                    .map(|j| StoredOrderedParagraph {
+                        hash: format!("hp{j}"),
+                        paragraph_id: j,
+                    })
+                    .collect(),
             })
             .collect();
         let mut buf = Vec::new();

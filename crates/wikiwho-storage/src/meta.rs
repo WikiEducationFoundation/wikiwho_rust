@@ -45,6 +45,21 @@ pub struct Meta {
     /// resume-from-disk path keep token-id assignment monotonic
     /// across restarts.
     pub next_token_id: u32,
+
+    /// Spam revision ids in detection order. Mirrors
+    /// `Article::spam_ids`; needed so the resume-from-disk path can
+    /// match `--show-spam-ids` output byte-for-byte and so a new
+    /// revision's spam-detection cascade has the same `spam_ids`
+    /// snapshot the in-memory algorithm would.
+    #[serde(default)]
+    pub spam_revisions: Vec<u64>,
+
+    /// Revision sha1 hashes flagged as spam. Mirrors
+    /// `Article::spam_hashes` — the first sanity check on a newly
+    /// arriving revision is "is this sha1 in spam_hashes?".
+    /// `wikiwho.py:80-82` / `:156-158`.
+    #[serde(default)]
+    pub spam_hashes: Vec<String>,
 }
 
 impl Meta {
@@ -65,6 +80,8 @@ impl Meta {
             n_lifetime_tokens: 0,
             n_spam_revisions: 0,
             next_token_id: 0,
+            spam_revisions: Vec::new(),
+            spam_hashes: Vec::new(),
         }
     }
 
@@ -84,7 +101,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let m = Meta {
-            schema_version: 1,
+            schema_version: 2,
             page_id: 534366,
             language: "en".into(),
             title: "Barack_Obama".into(),
@@ -95,6 +112,8 @@ mod tests {
             n_lifetime_tokens: 412345,
             n_spam_revisions: 1023,
             next_token_id: 412345,
+            spam_revisions: vec![123, 456, 789],
+            spam_hashes: vec!["sha1_a".into(), "sha1_b".into()],
         };
         let s = m.to_pretty_json().unwrap();
         let back: Meta = Meta::from_json(&s).unwrap();
