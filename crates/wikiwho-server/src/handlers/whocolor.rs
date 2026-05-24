@@ -398,9 +398,13 @@ async fn trigger_whocolor_cache_miss(
         );
         // `JoinHandle` is intentionally dropped — production code is
         // fire-and-forget; only tests `.await` it.
+        // MW echoes titles back with spaces (`Delon Hampton`); our
+        // TitleIndex keys on the underscored form that URL lookups
+        // produce. Normalize before storing so the next request hits
+        // the on-disk article instead of re-spawning.
         std::mem::drop(state.spawn_cache_miss(
             lang.to_string(),
-            info.title.clone(),
+            normalize_title(&info.title),
             info.page_id,
             fetcher,
         ));

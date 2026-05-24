@@ -399,3 +399,68 @@ async fn whocolor_rev_id_zero_treats_as_latest() {
     assert_eq!(body["success"], Value::Bool(true), "got: {body}");
     assert_eq!(body["rev_id"], rev_id);
 }
+
+/// Regression: MW echoes titles back with spaces (`Delon Hampton`)
+/// while our URL lookups normalize to underscores (`Delon_Hampton`).
+/// The whocolor handler has no page_id fallback (rev_content's title
+/// handler does), so when the index keyed on the spaced form
+/// missed the underscored lookup, every retry re-spawned a fresh
+/// cache-miss instead of serving the persisted article. Surfaced
+/// against the Wiki Education Dashboard's ArticleViewer on the
+/// first WMCloud deploy.
+#[tokio::test]
+async fn whocolor_with_spaced_title_serves_on_second_request() {
+    let Some(base_fixture) = load_fixture("zh/1686258/64806634") else {
+        return;
+    };
+    // Force a multi-word title — MW will echo this back with spaces,
+    // the request URL will use the underscored form.
+    let mut fixture = base_fixture.clone();
+    fixture.meta.title = "Some Multi Word Title".to_string();
+    let lang = fixture.meta.lang.clone();
+    let page_id = fixture.meta.page_id;
+    let rev_id = fixture.meta.rev_id;
+    let url_title = "Some_Multi_Word_Title";
+
+    let parsoid_html =
+        "<html><body><p>中国</p></body></html>".to_string();
+    let (action_url, rest_url) =
+        spawn_mock_mw(fixture.clone(), parsoid_html, HashMap::new()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let state = AppState::new(tmp.path().to_path_buf());
+    state.install_mw_client(
+        &lang,
+        MwClientBuilder::for_api_url(&action_url)
+            .rest_base_url(&rest_url)
+            .between_batches(Duration::from_millis(1))
+            .build()
+            .unwrap(),
+    );
+    let base = spawn_server(state.clone()).await;
+
+    let url = format!("{base}/{lang}/whocolor/v1.0.0-beta/{url_title}/{rev_id}/?origin=*");
+
+    // First request: still-processing envelope, cache-miss spawned.
+    let resp = reqwest::get(&url).await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], Value::Bool(false));
+
+    wait_for_processing(&state, &lang, page_id).await;
+
+    // Second request: must serve from disk. Before the fix, the
+    // TitleIndex held the spaced form ("Some Multi Word Title")
+    // while the URL produced the underscored form, so resolve_title
+    // returned None and the handler re-spawned cache-miss. Now the
+    // handler normalizes MW's title before storing.
+    let resp = reqwest::get(&url).await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["success"],
+        Value::Bool(true),
+        "second request should serve from disk, not re-spawn. got: {body}"
+    );
+    assert!(
+        !state.is_in_flight(&lang, page_id),
+        "second request must not re-spawn cache-miss"
+    );
+}

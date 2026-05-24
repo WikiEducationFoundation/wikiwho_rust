@@ -342,7 +342,12 @@ where
         Ok(info) => Some((
             info.page_id,
             CacheMissPlan {
-                title: info.title,
+                // MW echoes titles back with spaces; our TitleIndex
+                // keys on the underscored form that URL lookups
+                // produce. Normalize before storing so the next
+                // request hits the on-disk article instead of
+                // re-spawning the same cache-miss.
+                title: normalize_title(&info.title),
                 end_rev_id: info.last_revid,
             },
         )),
