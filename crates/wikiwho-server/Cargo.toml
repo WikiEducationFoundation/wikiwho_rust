@@ -13,6 +13,7 @@ axum = "0.8"
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"
 md-5 = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

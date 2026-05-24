@@ -20,6 +20,7 @@ pub mod params;
 pub mod routes;
 pub mod state;
 pub mod whocolor_html;
+pub mod whocolor_wikitext;
 
 pub use error::ServerError;
 pub use routes::router;
