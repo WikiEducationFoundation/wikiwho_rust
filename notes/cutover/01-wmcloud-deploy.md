@@ -60,11 +60,14 @@ a 4-core VPS.
 
 ## Step 2 — Watch the setup finish
 
-SSH in once the instance shows as Active (Horizon → Instances →
-click the instance → console URL):
+WMCloud SSH goes through `bastion.wmcloud.org` using your Wikitech
+username; the instance itself has only an internal IP. First-boot
+gotcha: a fresh VPS doesn't trust your LDAP-published SSH key
+until Puppet runs once (~30 min default). Wait 15-30 minutes after
+Horizon shows Active.
 
 ```bash
-ssh debian@<floating-ip>
+ssh -J <wikitech-username>@bastion.wmcloud.org debian@wikiwho-rs-1.globaleducation.eqiad1.wikimedia.cloud
 sudo tail -f /var/log/wikiwho-rs-setup.log
 ```
 
@@ -219,7 +222,7 @@ any it doesn't).
 After pushing a new commit upstream:
 
 ```bash
-ssh debian@<floating-ip>
+ssh -J <wikitech-username>@bastion.wmcloud.org debian@wikiwho-rs-1.globaleducation.eqiad1.wikimedia.cloud
 cd /home/wikiwho/wikiwho_rust
 sudo -u wikiwho git pull --ff-only
 sudo -u wikiwho /home/wikiwho/.cargo/bin/cargo build --release --bin wikiwho-server --bin ingest

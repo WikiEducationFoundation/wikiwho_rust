@@ -57,13 +57,22 @@ Click **Launch Instance**.
 
 ## Step 2 — Watch first boot finish
 
-Once the instance shows **Active** in Horizon, grab its floating IP
-and SSH in:
+Once the instance shows **Active** in Horizon, SSH in via the
+Wikimedia Cloud bastion (the VPS doesn't get a public IP — your
+Wikitech SSH key is pulled in via LDAP through bastion):
 
 ```bash
-ssh debian@<floating-ip>
+ssh -J <wikitech-username>@bastion.wmcloud.org debian@wikiwho-rs-1.globaleducation.eqiad1.wikimedia.cloud
 sudo tail -f /var/log/wikiwho-rs-setup.log
 ```
+
+> **First-boot SSH gotcha.** A fresh VPS doesn't trust your
+> Wikitech-published SSH key until the **first Puppet run** copies
+> the LDAP keys onto the box. Puppet runs every ~30 minutes by
+> default, so expect a 15–30 minute wait between Horizon showing
+> Active and SSH actually working. Symptom: `Permission denied
+> (publickey)`. The setup script runs as root via cloud-init and
+> finishes regardless — you'll just be late to see it.
 
 Wait for the line `=== Setup complete @ ... ===`. Below it you
 should see a healthz JSON line:
@@ -123,7 +132,7 @@ In another shell, tail the server log to watch the cache-miss in
 real time:
 
 ```bash
-ssh debian@<floating-ip> 'sudo journalctl -u wikiwho-rs-server -f'
+ssh -J <wikitech-username>@bastion.wmcloud.org debian@wikiwho-rs-1.globaleducation.eqiad1.wikimedia.cloud 'sudo journalctl -u wikiwho-rs-server -f'
 ```
 
 You'll see TraceLayer's per-request lines plus a structured
@@ -132,7 +141,7 @@ You'll see TraceLayer's per-request lines plus a structured
 ## Step 5 — Watch ingest activity
 
 ```bash
-ssh debian@<floating-ip> 'sudo journalctl -u wikiwho-rs-ingest -f'
+ssh -J <wikitech-username>@bastion.wmcloud.org debian@wikiwho-rs-1.globaleducation.eqiad1.wikimedia.cloud 'sudo journalctl -u wikiwho-rs-ingest -f'
 ```
 
 Log lines per simplewiki edit:
@@ -178,7 +187,7 @@ it doesn't.
 ### Re-deploy after a code change
 
 ```bash
-ssh debian@<floating-ip>
+ssh -J <wikitech-username>@bastion.wmcloud.org debian@wikiwho-rs-1.globaleducation.eqiad1.wikimedia.cloud
 cd /home/wikiwho/wikiwho_rust
 sudo -u wikiwho git pull --ff-only
 sudo -u wikiwho /home/wikiwho/.cargo/bin/cargo build --release --bin wikiwho-server --bin ingest
