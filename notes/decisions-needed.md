@@ -82,6 +82,39 @@ meantime: the bug is bounded (only fires on specific
 nested-template-with-newline patterns), and consumers see
 correct highlighting even when the warning appears.
 
+> **Resolved 2026-05-24 (later that day):** **C** — accept and
+> document, shelve, **not a Rust port bug**. Compared our deployment
+> to production for en/Icaro: HTML bytes 68,790 vs 68,790; the 194
+> differing bytes are all in the trailing MW parser-cache footer
+> (server hostname, timestamps, Lua/CPU timings, Render ID). The
+> `<span ...>}}</span>` template-bleed appears identically in both,
+> and a synthetic minimal repro confirmed the upstream Python
+> `WhoColor.parser.WikiMarkupParser` exhibits the same behavior.
+>
+> **Root cause** (traced via `scripts/icaro_trace_python.py`): in
+> `__get_next_special_element`, when a regex's first match from
+> `_wiki_text_pos` is in `_jumped_elems`, the entire markup type is
+> silently skipped rather than re-searching for a later match. After
+> descending into `{{multiple issues` at pos=54, the parser's `{{`
+> regex matches at pos=54 itself (in jumped_elems), so templates are
+> dropped; the next candidate is `=` at pos=100 (inside the inner
+> template's `|date=April 2016`). The cursor advances past the inner
+> `{{` at pos=72 without descending into it, then the outer frame
+> exits prematurely at the inner `}}`, leaving the outer `}}` for
+> top-level processing where it gets a span.
+>
+> The no-newline (Curzon) variant happens to work because after the
+> mis-chosen `=` recursion exits, the cursor is still before the
+> inner `{{` — so the re-derived `find_next_special_markup` catches
+> it on the second try. The newline variant fails because the
+> cursor has moved past the inner `{{` before re-derivation.
+>
+> Filed [issue #1](https://github.com/WikiEducationFoundation/wikiwho_rust/issues/1)
+> documenting the symptom, parity-match evidence, and the upstream
+> fix. Per parity-or-die, we won't diverge unilaterally; right
+> escalation is upstream contribution to
+> [wikimedia/WhoColor](https://github.com/wikimedia/WhoColor).
+
 ---
 
 ## 2026-05-24 — WhoColor HTML source: Parsoid vs MW Action API parse [resolved-with-followup]
