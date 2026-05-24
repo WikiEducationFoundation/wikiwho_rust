@@ -75,7 +75,7 @@ fi
 # --- 3. rustup (in wikiwho's HOME) ----------------------------------
 
 if [[ ! -x "${WIKIWHO_HOME}/.cargo/bin/cargo" ]]; then
-    sudo -u "${WIKIWHO_USER}" bash -c "
+    runuser -u "${WIKIWHO_USER}" -- bash -c "
         set -eu
         cd '${WIKIWHO_HOME}'
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -88,17 +88,17 @@ CARGO="${WIKIWHO_HOME}/.cargo/bin/cargo"
 # --- 4. repo clone / pull -------------------------------------------
 
 if [[ ! -d "${REPO_DIR}/.git" ]]; then
-    sudo -u "${WIKIWHO_USER}" git clone --depth=1 --branch "${REPO_REF}" \
+    runuser -u "${WIKIWHO_USER}" -- git clone --depth=1 --branch "${REPO_REF}" \
         "${REPO_URL}" "${REPO_DIR}"
 else
-    sudo -u "${WIKIWHO_USER}" git -C "${REPO_DIR}" fetch origin "${REPO_REF}"
-    sudo -u "${WIKIWHO_USER}" git -C "${REPO_DIR}" reset --hard "origin/${REPO_REF}"
+    runuser -u "${WIKIWHO_USER}" -- git -C "${REPO_DIR}" fetch origin "${REPO_REF}"
+    runuser -u "${WIKIWHO_USER}" -- git -C "${REPO_DIR}" reset --hard "origin/${REPO_REF}"
 fi
 
 # --- 5. build (release) ---------------------------------------------
 
 echo "--- building release binaries (this can take a few minutes on a small VPS) ---"
-sudo -u "${WIKIWHO_USER}" bash -c "
+runuser -u "${WIKIWHO_USER}" -- bash -c "
     set -eu
     cd '${REPO_DIR}'
     '${CARGO}' build --release --bin wikiwho-server --bin ingest

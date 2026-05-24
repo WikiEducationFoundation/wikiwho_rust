@@ -69,22 +69,22 @@ fi
 
 # --- Pull ---
 echo "--- pulling latest code ---"
-sudo -u "${WIKIWHO_USER}" git -C "${REPO_DIR}" fetch --tags origin
+runuser -u "${WIKIWHO_USER}" -- git -C "${REPO_DIR}" fetch --tags origin
 if [[ -n "${REF}" ]]; then
-    sudo -u "${WIKIWHO_USER}" git -C "${REPO_DIR}" checkout "${REF}"
+    runuser -u "${WIKIWHO_USER}" -- git -C "${REPO_DIR}" checkout "${REF}"
     # Fast-forward if REF is a branch; harmless on a detached HEAD ref.
-    sudo -u "${WIKIWHO_USER}" git -C "${REPO_DIR}" pull --ff-only || true
+    runuser -u "${WIKIWHO_USER}" -- git -C "${REPO_DIR}" pull --ff-only || true
 else
-    sudo -u "${WIKIWHO_USER}" git -C "${REPO_DIR}" checkout main
-    sudo -u "${WIKIWHO_USER}" git -C "${REPO_DIR}" reset --hard origin/main
+    runuser -u "${WIKIWHO_USER}" -- git -C "${REPO_DIR}" checkout main
+    runuser -u "${WIKIWHO_USER}" -- git -C "${REPO_DIR}" reset --hard origin/main
 fi
-HEAD_SHA=$(sudo -u "${WIKIWHO_USER}" git -C "${REPO_DIR}" rev-parse --short HEAD)
-HEAD_SUBJECT=$(sudo -u "${WIKIWHO_USER}" git -C "${REPO_DIR}" log -1 --format='%s')
+HEAD_SHA=$(runuser -u "${WIKIWHO_USER}" -- git -C "${REPO_DIR}" rev-parse --short HEAD)
+HEAD_SUBJECT=$(runuser -u "${WIKIWHO_USER}" -- git -C "${REPO_DIR}" log -1 --format='%s')
 echo "HEAD now at ${HEAD_SHA}: ${HEAD_SUBJECT}"
 
 # --- Build ---
 echo "--- building release binaries (release, may take a few minutes) ---"
-sudo -u "${WIKIWHO_USER}" "${CARGO}" build --release \
+runuser -u "${WIKIWHO_USER}" -- "${CARGO}" build --release \
     --manifest-path "${REPO_DIR}/Cargo.toml" \
     --bin wikiwho-server --bin ingest
 
