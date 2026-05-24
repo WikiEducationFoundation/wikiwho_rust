@@ -236,6 +236,20 @@ async fn serve_whocolor(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// Resolve an editor string to its display name. Mirrors
+/// `whocolor/handler.py:117` (`editor_names_dict.get(editor, editor)`):
+/// the raw editor string is the fallback. Registered users get looked
+/// up by user_id; anons (`0|<ip>`) and unknown editors echo the input
+/// verbatim — production keeps the `0|` prefix in the display name.
+fn display_name(editor: &str, editor_names: &HashMap<u64, String>) -> String {
+    if let Ok(id) = editor.parse::<u64>() {
+        if let Some(name) = editor_names.get(&id) {
+            return name.clone();
+        }
+    }
+    editor.to_string()
+}
+
 /// Collect the unique registered user_ids from a `WhoColorData`'s
 /// revisions list. Anons (editor starts with `0|`) and empty
 /// editors are excluded — we have nothing to look up for them.
@@ -283,20 +297,15 @@ fn build_whocolor_envelope(
 
     // revisions: dict keyed by rev_id (as string), value is
     //   [timestamp, parent_id, class_name, editor_name].
+    //
+    // Anonymous editors keep the literal `0|<ip>` form in the
+    // editor_name slot — production's `whocolor/handler.py:117` does
+    // `editor_names_dict.get(rev_data[2], rev_data[2])`, which returns
+    // the raw editor string when no mapping exists, prefix and all.
     let mut revisions_map = Map::new();
     for (rid, rev) in &data.revisions {
         let class_name = token_class_name(&rev.editor);
-        let editor_name = if rev.editor.starts_with("0|") {
-            // Anon: name is the part after "0|".
-            rev.editor.strip_prefix("0|").unwrap_or(&rev.editor).to_string()
-        } else if let Ok(id) = rev.editor.parse::<u64>() {
-            editor_names
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| rev.editor.clone())
-        } else {
-            rev.editor.clone()
-        };
+        let editor_name = display_name(&rev.editor, editor_names);
         revisions_map.insert(
             rid.to_string(),
             json!([
@@ -308,18 +317,22 @@ fn build_whocolor_envelope(
         );
     }
 
-    // present_editors: array of [name, class_name] pairs.
+    // present_editors: array of `[name, class_name, percentage]`
+    // triples. The percentage is `token_count / total_present_tokens *
+    // 100.0` per `WhoColor/parser.py:223-227`. API.md §7's example
+    // shows 2-tuples but production has long emitted 3-tuples; this
+    // matches what the WhoWroteThat gadget / Dashboard sidebar see.
+    let total_present_tokens: usize = present_editors.iter().map(|e| e.token_count).sum();
     let present_editors_json: Vec<Value> = present_editors
         .iter()
         .map(|e| {
-            let name = if e.editor.starts_with("0|") {
-                e.editor.strip_prefix("0|").unwrap_or(&e.editor).to_string()
-            } else if let Ok(id) = e.editor.parse::<u64>() {
-                editor_names.get(&id).cloned().unwrap_or_else(|| e.editor.clone())
+            let name = display_name(&e.editor, editor_names);
+            let pct = if total_present_tokens == 0 {
+                0.0
             } else {
-                e.editor.clone()
+                e.token_count as f64 * 100.0 / total_present_tokens as f64
             };
-            json!([name, e.class_name])
+            json!([name, e.class_name, pct])
         })
         .collect();
 
@@ -574,16 +587,21 @@ mod tests {
         assert_eq!(entry[2], "1"); // class_name
         assert_eq!(entry[3], "Alice"); // editor_name from `names` map
 
-        // present_editors is array of [name, class_name].
+        // present_editors is array of [name, class_name, percentage].
         let pe = env["present_editors"].as_array().unwrap();
         assert_eq!(pe.len(), 1);
-        let pair = pe[0].as_array().unwrap();
-        assert_eq!(pair[0], "Alice");
-        assert_eq!(pair[1], "1");
+        let triple = pe[0].as_array().unwrap();
+        assert_eq!(triple.len(), 3, "present_editors entries are triples");
+        assert_eq!(triple[0], "Alice");
+        assert_eq!(triple[1], "1");
+        assert!((triple[2].as_f64().unwrap() - 100.0).abs() < 1e-9);
     }
 
     #[test]
-    fn build_envelope_anon_uses_hashed_class_and_unwraps_name() {
+    fn build_envelope_anon_keeps_prefix_in_display_name() {
+        // Production's `whocolor/handler.py:117` falls back to the raw
+        // editor string when no MW name is known, which for anons
+        // means the literal `0|<ip>` form. We mirror that.
         let article = Article::new("X");
         let data = WhoColorData {
             tokens: vec![],
@@ -616,11 +634,15 @@ mod tests {
         let class = entry[2].as_str().unwrap();
         assert_eq!(class.len(), 32);
         assert!(class.chars().all(|c| c.is_ascii_hexdigit()));
-        // Editor name is the IP-looking suffix.
-        assert_eq!(entry[3], "192.0.2.1");
+        // Editor name keeps the `0|` prefix — matches what the
+        // production fixture emits for anons.
+        assert_eq!(entry[3], "0|192.0.2.1");
 
         let pe = env["present_editors"].as_array().unwrap();
-        let pair = pe[0].as_array().unwrap();
-        assert_eq!(pair[0], "192.0.2.1");
+        let triple = pe[0].as_array().unwrap();
+        assert_eq!(triple.len(), 3, "present_editors entries are triples");
+        assert_eq!(triple[0], "0|192.0.2.1");
+        // Percentage with one editor + one token = 100%.
+        assert!((triple[2].as_f64().unwrap() - 100.0).abs() < 1e-9);
     }
 }
