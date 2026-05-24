@@ -190,6 +190,65 @@ async fn fetch_parsoid_html_translates_404_to_page_missing() {
     assert!(matches!(err, wikiwho_mwclient::MwError::PageMissing { .. }));
 }
 
+// ---- action=parse HTML mock ----
+
+async fn action_parse_handler(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if params.get("action").map(|s| s.as_str()) != Some("parse") {
+        return Json(json!({"error": {"code": "wrongaction"}}));
+    }
+    // formatversion=2 → parse.text is a flat string.
+    Json(json!({
+        "parse": {
+            "title": "Cat",
+            "pageid": 1,
+            "revid": params.get("oldid").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+            "text": "<div class=\"mw-content-ltr mw-parser-output\"><p>hello world</p></div>"
+        }
+    }))
+}
+
+async fn action_parse_missing_rev_handler() -> impl IntoResponse {
+    Json(json!({
+        "error": {
+            "code": "nosuchrevid",
+            "info": "There is no revision with ID 9999."
+        }
+    }))
+}
+
+#[tokio::test]
+async fn fetch_rendered_html_extracts_parse_text() {
+    let app = Router::new().route("/w/api.php", get(action_parse_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = MwClientBuilder::for_api_url(format!("http://{addr}/w/api.php"))
+        .build()
+        .unwrap();
+    let html = client.fetch_rendered_html(12345).await.unwrap();
+    assert!(html.starts_with("<div class=\"mw-content-ltr mw-parser-output\""));
+    assert!(html.contains("hello world"));
+}
+
+#[tokio::test]
+async fn fetch_rendered_html_translates_nosuchrevid_to_page_missing() {
+    let app = Router::new().route("/w/api.php", get(action_parse_missing_rev_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = MwClientBuilder::for_api_url(format!("http://{addr}/w/api.php"))
+        .build()
+        .unwrap();
+    let err = client.fetch_rendered_html(9999).await.unwrap_err();
+    assert!(matches!(err, wikiwho_mwclient::MwError::PageMissing { .. }));
+}
+
 #[tokio::test]
 async fn fetch_parsoid_html_percent_encodes_title() {
     // Pick a title with characters that require percent-encoding so we

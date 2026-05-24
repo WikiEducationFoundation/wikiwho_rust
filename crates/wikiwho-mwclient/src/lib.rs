@@ -244,12 +244,19 @@ impl MwClient {
 
     /// Fetch Parsoid HTML for a specific `(title, rev_id)` from the
     /// wiki's REST API (`/api/rest_v1/page/html/{title}/{rev_id}`).
-    /// Used by the WhoColor endpoint as the substrate the
-    /// token-spans get injected into.
     ///
-    /// PLAN.md §4.6 settled on this endpoint as the HTML source. WMF
-    /// caches it aggressively at the edge; the response body is
-    /// generally immutable per `(lang, rev_id)`.
+    /// Originally PLAN.md §4.6 settled on this as the WhoColor HTML
+    /// source, but the first WMCloud deploy surfaced a structural
+    /// mismatch with production's wire format: Parsoid emits a full
+    /// document (DOCTYPE, head, RDF, section wrappers, data-mw
+    /// atoms) while production uses MW Action API `action=parse`
+    /// (content-only `<div class="mw-content-ltr ...">`). The
+    /// resulting text content differs enough that HTML-level token
+    /// matching collapses to ~3% coverage. See
+    /// `notes/decisions-needed.md`.
+    ///
+    /// Kept here for tests and for potential future use cases that
+    /// need the Parsoid view (e.g. a smarter content-extractor).
     pub async fn fetch_parsoid_html(&self, title: &str, rev_id: u64) -> Result<String> {
         let url = format!(
             "{base}/page/html/{title}/{rev_id}",
@@ -257,6 +264,54 @@ impl MwClient {
             title = urlencoding::encode(title),
         );
         self.request_text(&url).await
+    }
+
+    /// Fetch rendered HTML for a specific `rev_id` via MW Action API
+    /// `action=parse&oldid={rev_id}&prop=text&formatversion=2`.
+    ///
+    /// Matches production's WhoColor HTML source. Returns the value
+    /// of `parse.text` from the JSON envelope — a `<div class=
+    /// "mw-content-ltr mw-parser-output">` content tree with
+    /// templates/refs/links already expanded. This is the substrate
+    /// our `inject_spans` walks.
+    ///
+    /// Maps `MwError::PageMissing` for unknown rev_ids (MW returns
+    /// `{"error": ...}` rather than HTTP 404 in that case).
+    pub async fn fetch_rendered_html(&self, rev_id: u64) -> Result<String> {
+        let rev_id_str = rev_id.to_string();
+        let body = match self
+            .request_json(&[
+                ("action", "parse"),
+                ("oldid", &rev_id_str),
+                ("prop", "text"),
+                ("format", "json"),
+                ("formatversion", "2"),
+            ])
+            .await
+        {
+            Ok(b) => b,
+            // MW surfaces "no such revision" as a top-level
+            // `{"error": {...}}` body, which `request_json` has
+            // already promoted to `MwError::Api`. Translate the
+            // specific page/rev-missing codes to `PageMissing` so the
+            // handler can decline gracefully.
+            Err(MwError::Api { code, info }) => {
+                if matches!(
+                    code.as_str(),
+                    "missingtitle" | "nosuchrevid" | "invalidpageid" | "nosuchpageid"
+                ) {
+                    return Err(MwError::PageMissing { page_id: 0 });
+                }
+                return Err(MwError::Api { code, info });
+            }
+            Err(e) => return Err(e),
+        };
+
+        body.get("parse")
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| MwError::Shape("action=parse: missing parse.text".into()))
     }
 
     /// Low-level GET that returns the response body as a string.

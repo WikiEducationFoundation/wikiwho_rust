@@ -165,6 +165,21 @@ async fn action_handler(
     State(state): State<MockMw>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    // action=parse (used by fetch_rendered_html for WhoColor HTML)
+    if params.get("action").map(String::as_str) == Some("parse") {
+        let rev_id = params
+            .get("oldid")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        return Json(json!({
+            "parse": {
+                "title": "mock",
+                "pageid": 0,
+                "revid": rev_id,
+                "text": (*state.parsoid_html).clone(),
+            }
+        }));
+    }
     match params.get("prop").map(String::as_str) {
         Some("info") => Json((*state.info).clone()),
         Some("revisions") => Json((*state.revisions).clone()),

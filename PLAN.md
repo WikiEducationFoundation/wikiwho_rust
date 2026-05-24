@@ -347,6 +347,17 @@ edge, so we'd benefit from that.
 > one so swapping to Option B (Parsoid sidecar) is a fallback, not a
 > rewrite. Cache by `(lang, rev_id)` aggressively — the input is
 > immutable.
+>
+> **Revised 2026-05-24:** Option A's Parsoid HTML turned out
+> structurally too different from production's MW Action API
+> `action=parse` output. The first WMCloud deploy surfaced a 16/587
+> span-coverage gap on en/Delon_Hampton because Parsoid emits a full
+> document with section wrappers and `data-mw` atoms our text walk
+> doesn't account for. Switched the HTML source to MW Action API
+> `action=parse&oldid={rev_id}&prop=text` to match production's
+> pipeline. HTML-level span injection is kept; full byte-for-byte
+> parity (production's wikitext-level injection) is queued as a
+> follow-up in `notes/decisions-needed.md`.
 
 ## 5. Performance targets
 

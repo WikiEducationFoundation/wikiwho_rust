@@ -38,7 +38,7 @@ The plan documents several option-without-pick situations. These are now closed;
 |---|---|---|
 | Implementation language | Rust (Go as bail-out, never Python) | PLAN.md §3 |
 | Diff algorithm | Python `difflib.Differ` port (Ratcliff/Obershelp); Myers kept compiled for a possible later revisit | ALGORITHM.md §6 + notes/diff-algorithm-revisit.md |
-| WhoColor HTML source | MW REST `/page/html` + `html5ever` injection (Option A) | PLAN.md §4.6 |
+| WhoColor HTML source | MW Action API `action=parse&oldid={rev_id}&prop=text` (Option A revised 2026-05-24). Original Parsoid choice walked back after the first WMCloud deploy surfaced a 97% span-coverage gap. Full byte-for-byte parity via wikitext-level injection is queued. | PLAN.md §4.6 + notes/decisions-needed.md (2026-05-24 entry) |
 | Hash-table persistence | Strategy B, wholesale-rewrite initially, delta-log later | STORAGE.md §4 |
 
 If a parity failure or perf wall makes one of these no longer the right pick, add an entry to `notes/decisions-needed.md` and stop. Don't silently switch.

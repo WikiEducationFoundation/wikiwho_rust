@@ -15,7 +15,8 @@
 //! 3. [`get_whocolor_data`] → token + revision data with
 //!    conflict_score / age_seconds.
 //! 4. `mw.resolve_users` → editor user_id → display name.
-//! 5. `mw.fetch_parsoid_html` → article HTML.
+//! 5. `mw.fetch_rendered_html` → article HTML (MW Action API
+//!    `action=parse`, matching production's WhoColor pipeline).
 //! 6. [`crate::whocolor_html::inject_spans`] → spans injected; gets
 //!    `present_editors` as a side-effect.
 //! 7. Compose API.md §7 envelope.
@@ -172,7 +173,7 @@ async fn serve_whocolor(
         }
     };
     let editor_ids = unique_registered_editor_ids(&data);
-    let html_future = mw.fetch_parsoid_html(title, rev_id);
+    let html_future = mw.fetch_rendered_html(rev_id);
     let users_future = mw.resolve_users(&editor_ids);
     let (html_res, users_res) = tokio::join!(html_future, users_future);
 
@@ -195,7 +196,7 @@ async fn serve_whocolor(
             );
         }
         Err(e) => {
-            tracing::warn!(lang = %lang, error = %e, "fetch_parsoid_html failed");
+            tracing::warn!(lang = %lang, error = %e, "fetch_rendered_html failed");
             return error_503(&format!("Parsoid fetch failed: {e}"), title, Some(rev_id));
         }
     };

@@ -20,6 +20,79 @@ Format:
 
 ---
 
+## 2026-05-24 — WhoColor HTML source: Parsoid vs MW Action API parse [resolved-with-followup]
+
+**Context:** PLAN.md §4.6 resolved on MW REST `/page/html` (Parsoid)
+as the HTML substrate that `whocolor_html::inject_spans` walks.
+The first WMCloud deploy ran the Wiki Education Dashboard's
+ArticleViewer against our endpoint and surfaced a load-bearing
+mismatch with production's wire format:
+
+- **Production** fetches the wikitext for the target rev_id, then
+  asks the MW Action API to render it via `action=parse&prop=text`.
+  The output is a content-only `<div class="mw-content-ltr
+  mw-parser-output">` tree — no DOCTYPE, no head, no RDF, no
+  Parsoid section wrappers. Critically, production *injects spans
+  into the wikitext* before calling action=parse, so spans survive
+  the wikitext→HTML transformation by construction.
+- **Ours** fetched Parsoid HTML and ran `inject_spans` over the
+  rendered output, matching tokens against the visible text.
+  Parsoid emits a full document with structural wrappers and
+  expands templates differently; our text walk found only 16 of
+  ~587 expected token spans on en/Delon_Hampton (Dashboard testing
+  surfaced "only one word highlighted per user" because
+  ArticleViewer regex-matches `<span class="editor-token
+  token-editor-{userid}">` and most of a user's tokens never got
+  spans at all).
+
+**Options:**
+- **A. Switch the HTML source to MW Action API `action=parse&
+  oldid={rev_id}&prop=text&formatversion=2`.** Content-only HTML
+  closer in text content to wikitext. Our HTML-level `inject_spans`
+  should match a much higher fraction of tokens. Cheapest change;
+  doesn't get us to byte-for-byte parity vs production because
+  we still do HTML-level matching, not wikitext-level injection.
+- **B. Adopt production's wikitext-level injection pipeline.**
+  Fetch wikitext, walk it in tokenizer order, wrap each token in
+  `<span class="editor-token token-editor-{class}" id="token-{n}">…
+  </span>` markup at wikitext-byte positions, then send to
+  `action=parse`. Byte-for-byte parity attainable. Bigger build —
+  need a wikitext-position-aware tokenizer that emits the same
+  sequence as the algorithm crate's tokenizer, plus the
+  "special-element" exclusion logic that skips template / ref /
+  infobox tokens (cf. `WhoColor/parser.py::__parse_wiki_text`).
+- **C. Keep Parsoid, write a Parsoid-aware content extractor.**
+  Walk the Parsoid DOM, strip head/meta/section/figure atoms, get
+  closer to action=parse's text content. Easy to start, hard to
+  finish — Parsoid's structure evolves, and we'd carry an extra
+  data-mw-aware traversal for the rest of the project's life.
+
+**Recommendation:** **A** as the immediate fix (this session), with
+**B** filed as the next-iteration target for byte-for-byte parity
+once the action=parse coverage is measured. **C** as a fallback if
+WMF deprecates action=parse for new-style apps (no signal that
+they will).
+
+> **Resolved 2026-05-24:** chose **A** as the immediate switch.
+> `crates/wikiwho-mwclient` gained `fetch_rendered_html(rev_id)`
+> backed by `action=parse&oldid={}&prop=text&formatversion=2`,
+> with `MwError::Api` translated to `PageMissing` for
+> `nosuchrevid`/`missingtitle`/`invalidpageid`/`nosuchpageid`
+> codes. The whocolor handler now calls `fetch_rendered_html`
+> instead of `fetch_parsoid_html` (the latter kept around for
+> the future smart-extractor path). PLAN.md §4.6 and the
+> resolved-decisions table in CLAUDE.md updated. Tests updated:
+> the whocolor integration mock now serves `action=parse`
+> responses in the existing axum action_handler.
+>
+> **Followup queued (non-blocking):** option B (wikitext-level
+> injection) for full byte-for-byte parity with production. Worth
+> doing once we have measurements showing how much A leaves on the
+> table — see `notes/cutover/02-<date>-coverage.md` for the
+> next-session diagnostic.
+
+---
+
 ## 2026-05-23 — windowed revision fetch for ingest apply loop [non-blocking]
 
 **Context:** `wikiwho-ingest::apply::fetch_window` currently uses the
