@@ -1,0 +1,32 @@
+[package]
+name = "wikiwho-ingest"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "EventStreams listener + load-apply-save loop that keeps already-ingested articles up to date as new revisions land on MediaWiki."
+
+[dependencies]
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "signal", "io-util"] }
+futures-util = "0.3"
+async-stream = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+wikiwho-attribute = { path = "../wikiwho-attribute" }
+wikiwho-mwclient = { path = "../wikiwho-mwclient" }
+wikiwho-storage = { path = "../wikiwho-storage" }
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+
+[[bin]]
+name = "ingest"
+path = "src/bin/ingest.rs"
