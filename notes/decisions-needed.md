@@ -145,6 +145,25 @@ crate session — it determines whether the writer learns to emit
 `paragraphs.bin` / `sentences.bin` (B), embed everything in
 revisions.bin (A), or punt entirely (C).
 
+> **Resolved 2026-05-23 (part 14):** chose **B**.
+> `crates/wikiwho-storage/src/paragraphs.rs` and
+> `crates/wikiwho-storage/src/sentences.rs` are the new arena files
+> (`WWPG`/`GPWW` and `WWSN`/`NSWW` magics, varint+CRC like the rest).
+> `hashtables.bin` grows from `(hash, count)` to `(hash, Vec<arena_id>)`
+> buckets; `revisions.bin` gains per-rev `ordered_paragraphs` (hash +
+> arena-id pairs in document order) alongside the existing
+> `token_sequence`; `meta.json` gains `spam_revisions` + `spam_hashes`.
+> `SCHEMA_VERSION` bumps to 2 (no production data at v1 to preserve).
+> Reader now hydrates the full `Article` including paragraph/sentence
+> arenas, full hashtables, per-revision `paragraphs` +
+> `ordered_paragraphs`, `length`, `original_adds`, `spam_ids`,
+> `spam_hashes`. New integration test `resume_from_disk_*` proves the
+> end-to-end story: load a snapshot, apply more revisions, get
+> byte-identical wire format and identical structural state to a
+> single end-to-end replay. Validated on zh/1686258 (7 revs), simple/
+> 27263 (3.8k revs, high-vandalism), and en/24544 Photosynthesis
+> (5.5k revs).
+
 ---
 
 ## 2026-05-23 — parity-corpus: large prod-cache divergence on en/COVID-19 and ja/日本 (python ground truth at 100 %) [non-blocking]
