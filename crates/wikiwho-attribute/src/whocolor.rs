@@ -215,6 +215,13 @@ fn compute_conflict_score(article: &Article, inbound: &[RevId], outbound: &[RevI
     conflict_score
 }
 
+/// Public re-export of [`parse_mw_timestamp`] for the parity binary,
+/// which needs to convert production's age-anchor timestamps without
+/// pulling in chrono.
+pub fn parse_mw_timestamp_public(s: &str) -> Option<i64> {
+    parse_mw_timestamp(s)
+}
+
 /// Parse a MediaWiki revision timestamp (`YYYY-MM-DDTHH:MM:SSZ`,
 /// UTC, second precision) to Unix epoch seconds. Returns `None` on
 /// any parse failure — caller substitutes a reasonable default.

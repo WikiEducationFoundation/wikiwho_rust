@@ -1781,6 +1781,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wikiwho-attribute",
+ "wikiwho-server",
 ]
 
 [[package]]

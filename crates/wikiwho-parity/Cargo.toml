@@ -11,8 +11,13 @@ description = "Compare wikiwho-attribute output to captured production fixtures.
 name = "parity-check"
 path = "src/main.rs"
 
+[[bin]]
+name = "whocolor-parity"
+path = "src/bin/whocolor_parity.rs"
+
 [dependencies]
 wikiwho-attribute = { path = "../wikiwho-attribute" }
+wikiwho-server = { path = "../wikiwho-server" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
