@@ -10,10 +10,9 @@ __pycache__/
 .venv/
 venv/
 
-# Local Claude settings (per-machine, not shared)
-.claude/settings.local.json
-.claude/projects/
-.claude/scheduled_tasks.lock
+# Claude config — per-developer; project policy that becomes useful for
+# any contributor can be reintroduced later as a generic template.
+/.claude/
 
 # Editor / OS noise
 .DS_Store
