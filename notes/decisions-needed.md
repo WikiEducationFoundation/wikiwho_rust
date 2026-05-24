@@ -20,6 +20,72 @@ Format:
 
 ---
 
+## 2026-05-23 — windowed revision fetch for ingest apply loop [non-blocking]
+
+**Context:** `wikiwho-ingest::apply::fetch_window` currently uses the
+existing `MwClient::fetch_revisions(page_id, end_rev_id)` and discards
+revs whose rev_id is `<= start_exclusive` client-side. That paginator
+starts at the page's *first* revision when no `rvcontinue` is given —
+so for an Obama-class article (30k+ revs) where we just missed one
+edit, we read the whole history just to drop all but the trailing
+revision. Correct, but wasteful.
+
+**Options:**
+- **A. Add `MwClient::fetch_revisions_window(page_id, start_exclusive,
+  end_inclusive)` that sets MW's `rvstartid` param.** With
+  `rvdir=newer&rvstartid=last_good+1&rvendid=event_rev`, MW returns
+  exactly the window we want; the apply loop's client-side filter
+  becomes a no-op. Pros: linear in window size; one new method on the
+  client. Cons: minor — `rvstartid` is inclusive and we want
+  exclusive, so callers compute `start + 1`.
+- **B. Leave it.** For the typical "1-2 revs missed" case it's a
+  single MW round-trip regardless; only catastrophic gaps (an ingest
+  outage of hours) cause real waste. We could just monitor the
+  per-event apply latency and add this if hot articles start dragging
+  the cycle time.
+
+**Recommendation:** **A**, but as a non-blocking follow-up. The cleanest
+moment to land it is when we instrument ingest latency and see real
+numbers; until then the current code is correct and a one-batch
+overhead on hot articles is bounded (MW caps `rvlimit=max` at 500/page
+per request, so even Obama is ~60 batches per apply, ~1-2 minutes
+worst case). Surface when ingest latency dashboards exist.
+
+---
+
+## 2026-05-23 — revision-visibility-change SSE listener [non-blocking]
+
+**Context:** The legacy service has two parallel SSE listeners:
+`recentchange` (for edits/new pages) and `mediawiki.revision-
+visibility-change` (for revdel / suppress). The rewrite has only the
+first. When an editor visibility-changes a revision, the legacy
+service flips its `text_hidden`/`user_hidden`/`comment_hidden` flags
+to match the new MW state; the rewrite's stored articles remain at the
+pre-revdel state until the article gets another edit (whereupon
+`fetch_window` would see the suppressed slot and emit the modern
+hidden flags).
+
+**Options:**
+- **A. Add a second SSE listener for `revision-visibility-change`** in
+  `wikiwho-ingest` that triggers a "refetch + re-analyse from
+  affected rev" path. Pros: real-time visibility compliance. Cons:
+  re-analysing from an old rev means tearing down and rebuilding part
+  of the cascade — more code than the current apply loop.
+- **B. Don't add it; rely on re-bootstrap.** When a fixture or
+  language is re-bootstrapped (e.g. nightly), the new state is
+  picked up. In the interim, stored articles reflect the rev's MW
+  state at the moment of last edit. This is what XTools / Dashboard
+  / IV do today against the legacy service anyway, since the legacy
+  flag update is per-article-celery-task and lags real edits.
+- **C. Defer until a downstream consumer complains.** None of the
+  four consumers we're cutting over has flagged this as a blocker.
+
+**Recommendation:** **C** for now, **A** if/when a downstream consumer
+or compliance audit asks for tighter revdel propagation. Worth
+documenting so we don't forget it exists.
+
+---
+
 ## 2026-05-23 — rev_id → page_id index for endpoint 1 [non-blocking]
 
 **Context:** The `wikiwho-server` scaffold lands endpoints 2-6 (title /
