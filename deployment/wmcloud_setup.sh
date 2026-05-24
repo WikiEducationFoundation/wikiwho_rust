@@ -109,6 +109,11 @@ sudo -u "${WIKIWHO_USER}" bash -c "
 install -m 0755 "${REPO_DIR}/target/release/wikiwho-server" /usr/local/bin/wikiwho-server
 install -m 0755 "${REPO_DIR}/target/release/ingest"        /usr/local/bin/ingest
 
+# Self-updating redeploy helper. Symlinked so the in-repo script is
+# what gets executed — the next `sudo wikiwho-redeploy` picks up
+# whatever shipped in main.
+ln -sf "${REPO_DIR}/deployment/redeploy.sh" /usr/local/bin/wikiwho-redeploy
+
 # --- 7. storage dir -------------------------------------------------
 
 install -d -o "${WIKIWHO_USER}" -g "${WIKIWHO_USER}" -m 0750 /var/lib/wikiwho-rs

@@ -186,19 +186,25 @@ it doesn't.
 
 ### Re-deploy after a code change
 
+Single command on the VPS:
+
 ```bash
-ssh -J <wikitech-username>@bastion.wmcloud.org debian@wikiwho-rs-1.globaleducation.eqiad1.wikimedia.cloud
-cd /home/wikiwho/wikiwho_rust
-sudo -u wikiwho git pull --ff-only
-sudo -u wikiwho /home/wikiwho/.cargo/bin/cargo build --release --bin wikiwho-server --bin ingest
-sudo install -m 0755 target/release/wikiwho-server /usr/local/bin/wikiwho-server
-sudo install -m 0755 target/release/ingest        /usr/local/bin/ingest
-sudo systemctl restart wikiwho-rs-server wikiwho-rs-ingest
-curl -s http://127.0.0.1/healthz | jq .version
+sudo wikiwho-redeploy
 ```
 
-If the storage format bumped (rare; see `SCHEMA_VERSION` in
-`crates/wikiwho-storage`), reset storage first.
+That pulls `main`, rebuilds the release binaries, installs them,
+restarts both systemd units, and verifies `/healthz`. Options:
+
+```bash
+sudo wikiwho-redeploy --ref <branch-or-sha>   # deploy a specific commit
+sudo wikiwho-redeploy --wipe-storage          # after a SCHEMA_VERSION bump
+```
+
+(First time on an older VPS: run `sudo bash
+/home/wikiwho/wikiwho_rust/deployment/redeploy.sh` once — that
+self-installs the `/usr/local/bin/wikiwho-redeploy` symlink for
+subsequent invocations. Setups created after this change have it
+from first boot.)
 
 ### Check disk and memory
 
