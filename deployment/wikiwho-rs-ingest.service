@@ -1,0 +1,30 @@
+[Unit]
+Description=WikiWho (Rust rewrite) EventStreams ingest daemon
+Documentation=file:///home/wikiwho/wikiwho_rust/PLAN.md
+After=network-online.target wikiwho-rs-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wikiwho
+Group=wikiwho
+WorkingDirectory=/home/wikiwho/wikiwho_rust
+ExecStart=/usr/local/bin/ingest
+Restart=on-failure
+RestartSec=10s
+
+Environment=WIKIWHO_STORAGE=/var/lib/wikiwho-rs/storage
+# Initial deploy follows just simplewiki — small, low-churn, exercises
+# the apply loop without filling the small VPS disk. Add more wikis
+# (comma-separated, e.g. "simple,zh,eu") as confidence grows.
+Environment=WIKIWHO_INGEST_LANGS=simple
+Environment=RUST_LOG=info
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/wikiwho-rs
+
+[Install]
+WantedBy=multi-user.target

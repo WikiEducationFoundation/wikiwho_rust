@@ -1,0 +1,31 @@
+[Unit]
+Description=WikiWho (Rust rewrite) HTTP server
+Documentation=file:///home/wikiwho/wikiwho_rust/API.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wikiwho
+Group=wikiwho
+WorkingDirectory=/home/wikiwho/wikiwho_rust
+ExecStart=/usr/local/bin/wikiwho-server
+Restart=on-failure
+RestartSec=5s
+
+# Storage root on the VPS root disk (no Cinder volume in initial setup).
+Environment=WIKIWHO_STORAGE=/var/lib/wikiwho-rs/storage
+# Bind to localhost; nginx fronts public traffic.
+Environment=WIKIWHO_BIND=127.0.0.1:8088
+# tower-http TraceLayer emits at INFO; lower to "warn" if logs get noisy.
+Environment=RUST_LOG=info,tower_http=info
+
+# Minimal hardening.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/wikiwho-rs
+
+[Install]
+WantedBy=multi-user.target

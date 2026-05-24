@@ -16,8 +16,10 @@
 use axum::Router;
 use axum::routing::get;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
-use crate::handlers::{rev_content, whocolor};
+use crate::handlers::{health, rev_content, whocolor};
 use crate::state::AppState;
 
 /// Build the application router rooted at the wiki language segment.
@@ -27,7 +29,13 @@ pub fn router(state: AppState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let trace = TraceLayer::new_for_http()
+        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+        .on_response(DefaultOnResponse::new().level(Level::INFO));
+
     Router::new()
+        // Liveness probe (not part of API.md).
+        .route("/healthz", get(health::healthz))
         // Endpoint 1 — `/{lang}/api/{version}/rev_content/rev_id/{rev_id}/`
         .route(
             "/{lang}/api/{version}/rev_content/rev_id/{rev_id}/",
@@ -75,4 +83,5 @@ pub fn router(state: AppState) -> Router {
         )
         .with_state(state)
         .layer(cors)
+        .layer(trace)
 }
