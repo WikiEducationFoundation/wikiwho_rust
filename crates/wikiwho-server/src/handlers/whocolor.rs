@@ -78,18 +78,10 @@ pub struct WhoColorLatestPath {
 /// Query params for WhoColor. `origin=*` is sent by some consumers as
 /// a CORS workaround; the handler ignores it but accepting it via
 /// serde keeps axum's query parser happy.
-///
-/// `strip_templates=1` (POC) routes through
-/// [`crate::whocolor_template_strip`] which strips top-level templates
-/// from the wikitext before the modified-wikitext parse and renders
-/// each template separately in parallel. Lets us measure whether the
-/// template/Lua expansion that dominates the current 12s first-call
-/// time is worth lifting out of the main parse.
 #[derive(serde::Deserialize, Default)]
 #[allow(dead_code)] // fields are deserialization sinks
 pub struct WhoColorQuery {
     pub origin: Option<String>,
-    pub strip_templates: Option<u8>,
 }
 
 /// Endpoint 7: WhoColor for a specific rev_id.
@@ -99,25 +91,23 @@ pub struct WhoColorQuery {
 pub async fn whocolor_by_title_rev(
     State(state): State<AppState>,
     Path(path): Path<WhoColorRevPath>,
-    Query(query): Query<WhoColorQuery>,
+    Query(_query): Query<WhoColorQuery>,
 ) -> Response {
     let normalized_title = normalize_title(&path.title);
-    let strip = query.strip_templates == Some(1);
     if path.rev_id == 0 {
-        return serve_whocolor(state, &path.lang, &normalized_title, None, strip).await;
+        return serve_whocolor(state, &path.lang, &normalized_title, None).await;
     }
-    serve_whocolor(state, &path.lang, &normalized_title, Some(path.rev_id), strip).await
+    serve_whocolor(state, &path.lang, &normalized_title, Some(path.rev_id)).await
 }
 
 /// Endpoint 8: WhoColor for the latest processed revision.
 pub async fn whocolor_by_title_latest(
     State(state): State<AppState>,
     Path(path): Path<WhoColorLatestPath>,
-    Query(query): Query<WhoColorQuery>,
+    Query(_query): Query<WhoColorQuery>,
 ) -> Response {
     let normalized_title = normalize_title(&path.title);
-    let strip = query.strip_templates == Some(1);
-    serve_whocolor(state, &path.lang, &normalized_title, None, strip).await
+    serve_whocolor(state, &path.lang, &normalized_title, None).await
 }
 
 /// Shared service logic for both endpoints. `target_rev_id`:
@@ -128,7 +118,6 @@ async fn serve_whocolor(
     lang: &str,
     title: &str,
     target_rev_id: Option<u64>,
-    strip_templates: bool,
 ) -> Response {
     // 1. Title → page_id. If the article isn't indexed locally, ask
     //    MW to resolve and spawn cache-miss.
@@ -227,21 +216,10 @@ async fn serve_whocolor(
         }
     };
 
-    // 6. Inject spans into the wikitext, then render. Two paths:
-    //
-    //    Default: span-inject the whole wikitext and POST it through
-    //    MW's action=parse. MW carries our inline span tags through
-    //    to the rendered HTML, but pays full template + Lua expansion
-    //    on every call (parser cache misses because we modified the
-    //    wikitext).
-    //
-    //    `?strip_templates=1` (POC): strip top-level `{{…}}` ranges
-    //    first, span-inject only the remainder, parse the stripped
-    //    wikitext + each template separately in parallel, then splice
-    //    the rendered templates back into the stripped HTML. Designed
-    //    to skip MW's most expensive work (template/Lua expansion)
-    //    out of the parser-cache-cold path. See
-    //    `whocolor_template_strip.rs`.
+    // 6. Inject spans into the wikitext at each token's byte
+    //    position. Mirrors production's WikiMarkupParser approach
+    //    (see whocolor_wikitext.rs). spawn_blocking because the
+    //    regex sweeps + token walk are CPU-bound.
     let injection_tokens: Vec<WikitextToken> = data
         .tokens
         .iter()
@@ -251,73 +229,49 @@ async fn serve_whocolor(
             class_name: token_class_name(&t.editor),
         })
         .collect();
-
-    let (extended_html, present_editors): (
-        String,
-        Vec<crate::whocolor_html::PresentEditorEntry>,
-    ) = if strip_templates {
-        match crate::whocolor_template_strip::build_extended_html(
-            &mw,
-            title,
-            &wikitext,
-            &injection_tokens,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    lang = %lang,
-                    error = %e,
-                    "strip-templates path failed; not falling back in POC"
-                );
-                return error_503(
-                    &format!("Wikitext render failed (strip_templates=1): {e}"),
-                    title,
-                    Some(rev_id),
-                );
-            }
+    let wikitext_clone = wikitext.clone();
+    let injection = tokio::task::spawn_blocking(move || {
+        inject_spans_into_wikitext(&wikitext_clone, &injection_tokens)
+    })
+    .await;
+    let injection = match injection {
+        Ok(i) => i,
+        Err(join_err) => {
+            return error_500(
+                ServerError::Internal(format!(
+                    "wikitext span injection task panicked: {join_err}"
+                )),
+                title,
+            );
         }
-    } else {
-        let wikitext_clone = wikitext.clone();
-        let injection_tokens_clone = injection_tokens.clone();
-        let injection = tokio::task::spawn_blocking(move || {
-            inject_spans_into_wikitext(&wikitext_clone, &injection_tokens_clone)
-        })
-        .await;
-        let injection = match injection {
-            Ok(i) => i,
-            Err(join_err) => {
-                return error_500(
-                    ServerError::Internal(format!(
-                        "wikitext span injection task panicked: {join_err}"
-                    )),
-                    title,
-                );
-            }
-        };
-        let extended_html = match mw.parse_wikitext(title, &injection.wikitext).await {
-            Ok(html) => html,
-            Err(e) => {
-                tracing::warn!(lang = %lang, error = %e, "parse_wikitext failed");
-                return error_503(
-                    &format!("Wikitext render failed: {e}"),
-                    title,
-                    Some(rev_id),
-                );
-            }
-        };
-        let present_editors: Vec<crate::whocolor_html::PresentEditorEntry> = injection
-            .present_editors
-            .into_iter()
-            .map(|e| crate::whocolor_html::PresentEditorEntry {
-                editor: e.editor,
-                class_name: e.class_name,
-                token_count: e.token_count,
-            })
-            .collect();
-        (extended_html, present_editors)
     };
+
+    // 7. POST the span-decorated wikitext through MW Action API
+    //    `action=parse`. MW's parser carries the inline span tags
+    //    through to the rendered HTML.
+    let extended_html = match mw.parse_wikitext(title, &injection.wikitext).await {
+        Ok(html) => html,
+        Err(e) => {
+            tracing::warn!(lang = %lang, error = %e, "parse_wikitext failed");
+            return error_503(
+                &format!("Wikitext render failed: {e}"),
+                title,
+                Some(rev_id),
+            );
+        }
+    };
+
+    // Convert the wikitext module's PresentEditorEntry to the
+    // envelope-building type (same shape, different module).
+    let present_editors: Vec<crate::whocolor_html::PresentEditorEntry> = injection
+        .present_editors
+        .into_iter()
+        .map(|e| crate::whocolor_html::PresentEditorEntry {
+            editor: e.editor,
+            class_name: e.class_name,
+            token_count: e.token_count,
+        })
+        .collect();
 
     // 8. Compose the response envelope.
     let body = build_whocolor_envelope(
