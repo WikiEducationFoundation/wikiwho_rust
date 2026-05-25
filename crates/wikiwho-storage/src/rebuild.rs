@@ -112,8 +112,12 @@ fn scan_article(dir: &Path) -> Result<(u64, Vec<u64>)> {
     let meta = Meta::from_json(&meta_json)
         .with_context(|| format!("parsing meta.json in {}", dir.display()))?;
 
-    let revisions_bytes = fs::read(dir.join(REVISIONS_FILE))
-        .with_context(|| format!("reading revisions.bin in {}", dir.display()))?;
+    // revisions.bin is zstd-compressed (see writer::ZSTD_LEVEL).
+    let revisions_bytes = zstd::decode_all(
+        fs::File::open(dir.join(REVISIONS_FILE))
+            .with_context(|| format!("opening revisions.bin in {}", dir.display()))?,
+    )
+    .with_context(|| format!("decompressing revisions.bin in {}", dir.display()))?;
     let index = RevisionsIndex::new(&revisions_bytes)
         .with_context(|| format!("parsing revisions.bin header in {}", dir.display()))?;
     let rev_ids = index.rev_ids_sorted();

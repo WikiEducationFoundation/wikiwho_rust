@@ -75,8 +75,13 @@ impl SnapshotReader {
 
         let strings_bytes = fs::read(dir.join(STRINGS_FILE))?;
         let tokens_bytes = fs::read(dir.join(TOKENS_FILE))?;
-        let revisions_bytes = fs::read(dir.join(REVISIONS_FILE))?;
-        let paragraphs_bytes = fs::read(dir.join(PARAGRAPHS_FILE))?;
+        // revisions.bin and paragraphs.bin are zstd-compressed on disk
+        // (see writer::ZSTD_LEVEL). Both are big and highly repetitive;
+        // raw fs::read of the decompressed equivalent is actually
+        // slower than zstd::decode_all of the compressed file because
+        // it reads ~100× more bytes from disk.
+        let revisions_bytes = zstd::decode_all(fs::File::open(dir.join(REVISIONS_FILE))?)?;
+        let paragraphs_bytes = zstd::decode_all(fs::File::open(dir.join(PARAGRAPHS_FILE))?)?;
         let sentences_bytes = fs::read(dir.join(SENTENCES_FILE))?;
         let hashtables_bytes = fs::read(dir.join(HASHTABLES_FILE))?;
 

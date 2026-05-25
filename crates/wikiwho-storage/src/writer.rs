@@ -40,6 +40,12 @@ use crate::strings::write_strings;
 use crate::tokens::{write_tokens, StoredToken};
 use crate::{Result, StorageError};
 
+/// zstd level for `revisions.bin` and `paragraphs.bin`. Level 3 (the
+/// zstd default) hits 100-300× compression on the highly repetitive
+/// token-id / paragraph-id streams for negligible CPU cost; higher
+/// levels save only a few extra percent.
+const ZSTD_LEVEL: i32 = 3;
+
 /// Write `article` to disk under `volume`, sharded by language +
 /// page_id (see [`article_dir`]). Returns the directory path that was
 /// written.
@@ -293,21 +299,19 @@ fn write_tokens_file(dir: &Path, tokens: &[StoredToken]) -> Result<()> {
 
 fn write_revisions_file(dir: &Path, revisions: &[StoredRevision]) -> Result<()> {
     let path = dir.join(REVISIONS_FILE);
-    let mut w = BufWriter::new(File::create(path)?);
-    write_revisions(&mut w, revisions)?;
-    w.into_inner()
-        .map_err(|e| StorageError::Io(e.into_error()))?
-        .sync_all()?;
+    let file = File::create(&path)?;
+    let mut enc = zstd::stream::write::Encoder::new(file, ZSTD_LEVEL)?;
+    write_revisions(&mut enc, revisions)?;
+    enc.finish()?.sync_all()?;
     Ok(())
 }
 
 fn write_paragraphs_file(dir: &Path, paragraphs: &[StoredParagraph]) -> Result<()> {
     let path = dir.join(PARAGRAPHS_FILE);
-    let mut w = BufWriter::new(File::create(path)?);
-    write_paragraphs(&mut w, paragraphs)?;
-    w.into_inner()
-        .map_err(|e| StorageError::Io(e.into_error()))?
-        .sync_all()?;
+    let file = File::create(&path)?;
+    let mut enc = zstd::stream::write::Encoder::new(file, ZSTD_LEVEL)?;
+    write_paragraphs(&mut enc, paragraphs)?;
+    enc.finish()?.sync_all()?;
     Ok(())
 }
 
