@@ -19,21 +19,30 @@
 //!
 //! ## Flow
 //!
-//! 1. Find top-level `{{…}}` ranges in the wikitext.
-//! 2. Replace each with a unique PUA-bounded placeholder
+//! 1. Run the existing `inject_spans_into_wikitext` on the ORIGINAL
+//!    wikitext. Important: do this BEFORE stripping, because the
+//!    parser uses substring matching to find each token's position,
+//!    and that only works correctly when the wikitext has every
+//!    token's string in document order — including tokens inside
+//!    template regions (which the parser walks past as no_spans
+//!    regions but still consumes from the token list).
+//! 2. Find top-level `{{…}}` ranges in the SPANNED wikitext. Spans
+//!    don't appear inside template regions (the parser suppresses
+//!    them per SPECIAL_MARKUPS), so the `{{ }}` boundaries stay
+//!    intact and the depth-counter walker still finds them.
+//! 3. Replace each template with a unique PUA-bounded placeholder
 //!    `\u{E000}T<n>\u{E001}`. MW's parser passes PUA codepoints
-//!    through unmodified, so the placeholder appears verbatim in the
-//!    rendered output.
-//! 3. Inject spans into the stripped wikitext. Tokens whose strings
-//!    only existed inside templates won't be findable in the stripped
-//!    wikitext and are silently skipped by `set_token` — that matches
-//!    the existing no-spans-inside-templates behavior.
+//!    through unmodified.
 //! 4. In parallel: POST the stripped+spans wikitext, AND POST each
 //!    extracted template's wikitext individually. The main POST is
-//!    fast (no templates to expand); each template POST is fast (small
-//!    input, MW may cache repeated invocations of common templates).
-//! 5. Splice each rendered template back into the stripped HTML at
-//!    its placeholder position.
+//!    fast (no templates to expand); each template POST is fast
+//!    (small input, MW caches repeated invocations).
+//! 5. Strip the `<div class="mw-parser-output">` wrapper + trailing
+//!    NewPP / Transclusion comments from each template's parse
+//!    output — those are MW's per-parse envelope and shouldn't nest
+//!    inside the main article wrapper.
+//! 6. Splice each cleaned template back into the main HTML at its
+//!    placeholder position.
 //!
 //! ## Trade-offs / caveats
 //!
@@ -150,6 +159,41 @@ pub fn splice_templates(stripped_html: &str, rendered_templates: &[String]) -> S
     result
 }
 
+/// Strip the per-parse envelope from one template's `action=parse`
+/// output. MW wraps every parse result in
+/// `<div class="mw-content-ltr mw-parser-output" lang dir>…</div>`
+/// plus trailing `<!-- NewPP… --> <!-- Transclusion… -->` metadata
+/// comments. We splice only the inner content; otherwise each
+/// template's wrapper would nest inside the main article wrapper.
+fn extract_mw_parser_output_content(html: &str) -> String {
+    let prefix = "<div class=\"mw-content-ltr mw-parser-output\"";
+    let Some(start_idx) = html.find(prefix) else {
+        return html.to_string();
+    };
+    let after_open = match html[start_idx..].find('>') {
+        Some(p) => start_idx + p + 1,
+        None => return html.to_string(),
+    };
+    let Some(rel) = html[after_open..].rfind("</div>") else {
+        return html[after_open..].to_string();
+    };
+    let content_end = after_open + rel;
+    let mut content = &html[after_open..content_end];
+    // Strip trailing NewPP / Transclusion metadata comments. They
+    // appear at the end of MW's parse output, possibly preceded by
+    // newlines.
+    if let Some(p) = content.find("\n<!-- \nNewPP") {
+        content = &content[..p];
+    } else if let Some(p) = content.find("\n<!--\nNewPP") {
+        content = &content[..p];
+    } else if let Some(p) = content.find("\n<!-- \nTransclusion") {
+        content = &content[..p];
+    } else if let Some(p) = content.find("\n<!--\nTransclusion") {
+        content = &content[..p];
+    }
+    content.trim_end_matches(|c: char| c.is_whitespace()).to_string()
+}
+
 /// Build the whocolor `extended_html` via the template-strip flow.
 ///
 /// On any MW error the caller should fall back to the full-parse path.
@@ -159,34 +203,39 @@ pub async fn build_extended_html(
     wikitext: &str,
     tokens: &[WikitextToken],
 ) -> Result<(String, Vec<PresentEditorEntry>), MwError> {
-    let ranges = find_top_level_template_ranges(wikitext);
-    let (stripped_wikitext, templates) = strip_templates(wikitext, &ranges);
-
-    tracing::info!(
-        title = %title,
-        n_templates = templates.len(),
-        wikitext_bytes = wikitext.len(),
-        stripped_bytes = stripped_wikitext.len(),
-        "template-strip whocolor",
-    );
-
-    // CPU-bound — bounce off the blocking pool. Tokens whose strings
-    // only existed inside templates won't be findable in
-    // `stripped_wikitext` and are silently skipped by `set_token`.
-    let stripped_for_task = stripped_wikitext.clone();
-    let tokens_for_task: Vec<WikitextToken> = tokens.to_vec();
+    // 1. Span-inject FIRST on the original wikitext. The parser uses
+    //    substring matching to position each token; that only works
+    //    when every token's string is findable in document order,
+    //    including tokens inside templates that the parser walks past
+    //    as no_spans regions.
+    let wikitext_owned = wikitext.to_string();
+    let tokens_owned: Vec<WikitextToken> = tokens.to_vec();
     let injection = tokio::task::spawn_blocking(move || {
-        inject_spans_into_wikitext(&stripped_for_task, &tokens_for_task)
+        inject_spans_into_wikitext(&wikitext_owned, &tokens_owned)
     })
     .await
     .map_err(|e| {
         MwError::Shape(format!("strip-templates injection task panicked: {e}"))
     })?;
 
-    // Parallel: main parse + per-template parses. Same `title` for
-    // every call so context-sensitive magic words ({{PAGENAME}} etc.)
-    // resolve the same way.
-    let main_parse = mw.parse_wikitext(title, &injection.wikitext);
+    // 2-3. Now find templates in the SPANNED wikitext and strip
+    //      them. The parser doesn't inject spans inside templates
+    //      (no_spans=true), so `{{ }}` boundaries are untouched.
+    let ranges = find_top_level_template_ranges(&injection.wikitext);
+    let (stripped_wikitext, templates) = strip_templates(&injection.wikitext, &ranges);
+
+    tracing::info!(
+        title = %title,
+        n_templates = templates.len(),
+        spanned_bytes = injection.wikitext.len(),
+        stripped_bytes = stripped_wikitext.len(),
+        "template-strip whocolor",
+    );
+
+    // 4. Parallel: main parse + per-template parses. Same `title`
+    //    for every call so context-sensitive magic words
+    //    ({{PAGENAME}} etc.) resolve consistently.
+    let main_parse = mw.parse_wikitext(title, &stripped_wikitext);
     let mut template_handles = Vec::with_capacity(templates.len());
     for tpl in &templates {
         let mw_clone = mw.clone();
@@ -196,7 +245,6 @@ pub async fn build_extended_html(
             mw_clone.parse_wikitext(&title_clone, &tpl_clone).await
         }));
     }
-
     let main_html = main_parse.await?;
     let mut rendered_templates: Vec<String> = Vec::with_capacity(template_handles.len());
     for h in template_handles {
@@ -206,7 +254,14 @@ pub async fn build_extended_html(
         rendered_templates.push(res?);
     }
 
-    let final_html = splice_templates(&main_html, &rendered_templates);
+    // 5. Strip each template's per-parse envelope.
+    let cleaned_templates: Vec<String> = rendered_templates
+        .iter()
+        .map(|t| extract_mw_parser_output_content(t))
+        .collect();
+
+    // 6. Splice cleaned templates into the main HTML.
+    let final_html = splice_templates(&main_html, &cleaned_templates);
 
     let present_editors = injection
         .present_editors
