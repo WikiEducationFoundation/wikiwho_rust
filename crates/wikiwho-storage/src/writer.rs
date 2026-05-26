@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use wikiwho_attribute::structures::{Article, iter_rev_tokens};
@@ -40,10 +39,13 @@ use crate::strings::write_strings;
 use crate::tokens::{write_tokens, StoredToken};
 use crate::{Result, StorageError};
 
-/// zstd level for `revisions.bin` and `paragraphs.bin`. Level 3 (the
-/// zstd default) hits 100-300× compression on the highly repetitive
-/// token-id / paragraph-id streams for negligible CPU cost; higher
-/// levels save only a few extra percent.
+/// zstd level for the per-article `.bin` files. Level 3 (the zstd
+/// default) hits 100-300× compression on the highly repetitive
+/// token-id / paragraph-id streams in `revisions.bin` + `paragraphs.bin`
+/// and 2-9× on the other four (`tokens.bin`, `sentences.bin`,
+/// `strings.bin`, `hashtables.bin`). See
+/// `notes/2026-05-25-storage-compression.md` for the per-file
+/// measurements. Higher levels save only a few extra percent.
 const ZSTD_LEVEL: i32 = 3;
 
 /// Write `article` to disk under `volume`, sharded by language +
@@ -279,21 +281,19 @@ fn project_meta(article: &Article, language: &str) -> Meta {
 
 fn write_strings_file(dir: &Path, strings: &[&str]) -> Result<()> {
     let path = dir.join(STRINGS_FILE);
-    let mut w = BufWriter::new(File::create(path)?);
-    write_strings(&mut w, strings)?;
-    w.into_inner()
-        .map_err(|e| StorageError::Io(e.into_error()))?
-        .sync_all()?;
+    let file = File::create(&path)?;
+    let mut enc = zstd::stream::write::Encoder::new(file, ZSTD_LEVEL)?;
+    write_strings(&mut enc, strings)?;
+    enc.finish()?.sync_all()?;
     Ok(())
 }
 
 fn write_tokens_file(dir: &Path, tokens: &[StoredToken]) -> Result<()> {
     let path = dir.join(TOKENS_FILE);
-    let mut w = BufWriter::new(File::create(path)?);
-    write_tokens(&mut w, tokens)?;
-    w.into_inner()
-        .map_err(|e| StorageError::Io(e.into_error()))?
-        .sync_all()?;
+    let file = File::create(&path)?;
+    let mut enc = zstd::stream::write::Encoder::new(file, ZSTD_LEVEL)?;
+    write_tokens(&mut enc, tokens)?;
+    enc.finish()?.sync_all()?;
     Ok(())
 }
 
@@ -317,21 +317,19 @@ fn write_paragraphs_file(dir: &Path, paragraphs: &[StoredParagraph]) -> Result<(
 
 fn write_sentences_file(dir: &Path, sentences: &[StoredSentence]) -> Result<()> {
     let path = dir.join(SENTENCES_FILE);
-    let mut w = BufWriter::new(File::create(path)?);
-    write_sentences(&mut w, sentences)?;
-    w.into_inner()
-        .map_err(|e| StorageError::Io(e.into_error()))?
-        .sync_all()?;
+    let file = File::create(&path)?;
+    let mut enc = zstd::stream::write::Encoder::new(file, ZSTD_LEVEL)?;
+    write_sentences(&mut enc, sentences)?;
+    enc.finish()?.sync_all()?;
     Ok(())
 }
 
 fn write_hashtables_file(dir: &Path, tables: &HashTables) -> Result<()> {
     let path = dir.join(HASHTABLES_FILE);
-    let mut w = BufWriter::new(File::create(path)?);
-    crate::hashtables::write_hashtables(&mut w, tables)?;
-    w.into_inner()
-        .map_err(|e| StorageError::Io(e.into_error()))?
-        .sync_all()?;
+    let file = File::create(&path)?;
+    let mut enc = zstd::stream::write::Encoder::new(file, ZSTD_LEVEL)?;
+    crate::hashtables::write_hashtables(&mut enc, tables)?;
+    enc.finish()?.sync_all()?;
     Ok(())
 }
 
